@@ -1,0 +1,12 @@
+host_app/.venv/
+host_app/__pycache__/
+host_app/records/
+host_app/**/*.pyc
+host_app/**/*.pyo
+
+LEDtest/build/
+LEDtest/build_codex/
+
+.DS_Store
+Thumbs.db
+超声声纳通信协议.pdf
