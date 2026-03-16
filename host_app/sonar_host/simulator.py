@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass, field
 from struct import pack, unpack_from
 
-from .models import CaptureType, CommandId, DeviceStatus, ResultCode, WaveDataType
+from .models import CaptureType, CommandId, DeviceStatus, ProbeType, ResultCode, WaveDataType
 from .protocol import Frame, FrameDecoder, chunk_samples
 
 
@@ -39,6 +39,8 @@ class SimulatedDevice:
     debug_step_angle: int = 0
     debug_sample_count: int = 256
     debug_capture_type: CaptureType = CaptureType.RAW_WAVE
+    debug_probe_type: ProbeType = ProbeType.ROTARY_DEBUG
+    debug_pulse_count: int = 6
     debug_flags: int = 0
     history: list[str] = field(default_factory=list)
     _decoder: FrameDecoder = field(default_factory=FrameDecoder)
@@ -130,10 +132,13 @@ class SimulatedDevice:
                 self.debug_end_angle,
                 self.debug_step_angle,
                 capture_type,
+                probe_type,
                 self.debug_sample_count,
+                self.debug_pulse_count,
                 self.debug_flags,
             ) = _parse_debug_payload(frame.payload)
             self.debug_capture_type = CaptureType(capture_type)
+            self.debug_probe_type = ProbeType(probe_type)
             return [self._ack(frame.sequence, command, pack("<BB", 1, 1))]
 
         if command == CommandId.MOVE_TO_ANGLE:
@@ -263,10 +268,22 @@ def _parse_scan_payload(payload: bytes) -> tuple[int, int, int, int]:
     return unpack_from("<HHBB", payload, 0)
 
 
-def _parse_debug_payload(payload: bytes) -> tuple[int, int, int, int, int, int]:
-    if len(payload) < 9:
-        return 0, 0, 0, int(CaptureType.RAW_WAVE), 256, 0x0D
-    return unpack_from("<HHHBHB", payload, 0)
+def _parse_debug_payload(payload: bytes) -> tuple[int, int, int, int, int, int, int, int]:
+    if len(payload) >= 12:
+        return unpack_from("<HHHBBHBB", payload, 0)
+    if len(payload) >= 10:
+        start_angle, end_angle, step_angle, capture_type, sample_count, flags = unpack_from("<HHHBHB", payload, 0)
+        return (
+            start_angle,
+            end_angle,
+            step_angle,
+            capture_type,
+            int(ProbeType.ROTARY_DEBUG),
+            sample_count,
+            6,
+            flags,
+        )
+    return 0, 0, 0, int(CaptureType.RAW_WAVE), int(ProbeType.ROTARY_DEBUG), 256, 6, 0x0D
 
 
 def _calc_point_count(scan_step: int) -> int:

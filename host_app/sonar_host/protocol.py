@@ -129,12 +129,14 @@ def encode_scan_config(sequence: int, config: ScanConfig) -> bytes:
 
 def encode_debug_config(sequence: int, config: DebugConfig) -> bytes:
     payload = pack(
-        "<HHHBHB",
+        "<HHHBBHBB",
         config.start_angle,
         config.end_angle,
         config.step_angle,
         int(config.capture_type),
+        int(config.probe_type),
         config.sample_count,
+        config.pulse_count,
         config.flags,
     )
     return Frame(CommandId.CONFIG_DEBUG, sequence, payload).encode()

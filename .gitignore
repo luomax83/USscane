@@ -1,12 +1,23 @@
 host_app/.venv/
+host_app/build/
+host_app/dist/
+host_app/release/
+host_app/_installer_stage/
 host_app/__pycache__/
-host_app/records/
 host_app/**/*.pyc
 host_app/**/*.pyo
+host_app/records/
 
-LEDtest/build/
-LEDtest/build_codex/
+H743VGT6v2/build/
+H743VGT6v2/build_manual/
+H743VGT6v2/*.o
+H743VGT6v2/*.elf
+H743VGT6v2/*.hex
+H743VGT6v2/*.bin
+H743VGT6v2/*.map
+
+debug_capture/*.bin
+debug_capture/*.png
 
 .DS_Store
 Thumbs.db
-超声声纳通信协议.pdf

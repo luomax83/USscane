@@ -63,6 +63,11 @@ class CaptureType(IntEnum):
     ENVELOPE = 0x01
 
 
+class ProbeType(IntEnum):
+    ROTARY_DEBUG = 0x00
+    DEPTH_PROBE = 0x01
+
+
 class WaveDataType(IntEnum):
     U8_RAW = 0x00
     U16_RAW = 0x01
@@ -85,6 +90,8 @@ class DebugConfig:
     capture_type: CaptureType
     sample_count: int
     flags: int
+    probe_type: ProbeType = ProbeType.ROTARY_DEBUG
+    pulse_count: int = 6
 
 
 @dataclass(slots=True)

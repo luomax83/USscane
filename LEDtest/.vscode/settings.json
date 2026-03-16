@@ -1,9 +1,0 @@
-{
-    "cortex-debug.armToolchainPath": "D:/ST/STM32CubeCLT_1.21.0/GNU-tools-for-STM32/bin",
-    "cortex-debug.JLinkGDBServerPath": "C:/Program Files/SEGGER/JLink_V816/JLinkGDBServerCL.exe",
-    "files.associations": {
-        "*.ioc": "ini"
-    },
-    "stm32-for-vscode.openOCDPath": false,
-    "stm32-for-vscode.makePath": false
-}

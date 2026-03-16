@@ -25,6 +25,7 @@ from sonar_host.models import (
     DeviceStatus,
     DistanceResult,
     MediumType,
+    ProbeType,
     ScanConfig,
     ScanPoint,
     WaveDataType,
@@ -63,6 +64,9 @@ from sonar_host.simulator import SimulatedDevice
 APP_DIR = Path(__file__).resolve().parent
 RECORD_ROOT = APP_DIR / "records"
 SIMULATOR_PORT = "SIMULATOR"
+ADC_REFERENCE_VOLTAGE = 3.3
+ADC_FULL_SCALE = 65535.0
+WAVE_SAMPLE_RATE_HZ = 3_000_000.0
 
 EVENT_LABELS = {
     0x01: "Zeroing start",
@@ -139,7 +143,11 @@ TEXTS = {
         "point_cloud_status": "3D Status",
         "debug_controls": "Debug Controls",
         "debug_state": "Debug State",
-        "target_angle": "Target Angle",
+        "probe_type": "Probe Type",
+        "depth_probe": "Depth Probe",
+        "rotary_probe": "Side-scan Probe",
+        "pulse_count": "Pulse Count",
+        "debug_sound_speed": "Wave Speed",
         "sweep_start": "Sweep Start",
         "sweep_end": "Sweep End",
         "sweep_step": "Sweep Step",
@@ -150,6 +158,7 @@ TEXTS = {
         "config_single": "Config Single",
         "move_to_angle": "Move To Angle",
         "single_measure": "Single Measure",
+        "test_button": "Test",
         "config_sweep": "Config Sweep",
         "start_sweep": "Start Sweep",
         "save_wave_csv": "Save Wave CSV",
@@ -222,7 +231,11 @@ TEXTS = {
         "point_cloud_status": "3D 状态",
         "debug_controls": "调试控制",
         "debug_state": "调试状态",
-        "target_angle": "目标角度",
+        "probe_type": "探头类型",
+        "depth_probe": "测深度探头",
+        "rotary_probe": "侧扫探头",
+        "pulse_count": "脉冲数量",
+        "debug_sound_speed": "波速",
         "sweep_start": "起始角",
         "sweep_end": "结束角",
         "sweep_step": "扫角步进",
@@ -233,6 +246,7 @@ TEXTS = {
         "config_single": "配置单点",
         "move_to_angle": "转到目标角",
         "single_measure": "单次测量",
+        "test_button": "测试",
         "config_sweep": "配置扫角",
         "start_sweep": "开始扫角",
         "save_wave_csv": "保存波形 CSV",
@@ -406,6 +420,21 @@ class SquareViewport(QtWidgets.QWidget):
         y_offset = (self.height() - side) // 2
         self.child.setGeometry(x_offset, y_offset, side, side)
         super().resizeEvent(event)
+
+
+class DistanceAxisItem(pg.AxisItem):
+    def __init__(self, *, parent: "MainWindow") -> None:
+        super().__init__(orientation="top")
+        self._parent = parent
+
+    def tickStrings(self, values: list[float], scale: float, spacing: float) -> list[str]:
+        wave_speed = self._parent.debug_sound_speed_spin.value() if hasattr(self._parent, "debug_sound_speed_spin") else 1500
+        factor = float(wave_speed) / 2000.0
+        labels: list[str] = []
+        for value in values:
+            distance_mm = value * factor
+            labels.append(f"{distance_mm:.2f}")
+        return labels
 
 
 class SessionRecorder:
@@ -670,7 +699,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_wave_angle = 0
         self.current_wave_data_type = WaveDataType.U8_RAW
         self.current_wave_samples: list[int] = []
+        self.current_wave_display_samples: list[float] = []
         self.wave_streams: dict[int, dict[str, Any]] = {}
+        self.debug_probe_type = ProbeType.DEPTH_PROBE
         self.lap_count = 0
         self.rings_at_position = 0
         self.axial_position_mm = 0.0
@@ -793,7 +824,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.info_button.clicked.connect(self._request_device_info)
         self.zero_button.clicked.connect(self._request_zeroing)
         self.stop_button.clicked.connect(self._request_stop)
-        self.tabs.currentChanged.connect(self._sync_mode_label)
+        self.tabs.currentChanged.connect(self._handle_tab_changed)
         self.language_combo.currentIndexChanged.connect(self._change_language)
         self._retranslate_ui()
 
@@ -1007,12 +1038,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.debug_control_group.setMaximumWidth(330)
         control_form = QtWidgets.QFormLayout(self.debug_control_group)
 
-        self.target_angle_title = QtWidgets.QLabel()
-        self.target_angle_spin = QtWidgets.QDoubleSpinBox()
-        self.target_angle_spin.setDecimals(2)
-        self.target_angle_spin.setRange(0.0, 359.99)
-        self.target_angle_spin.setValue(45.0)
-        self.target_angle_spin.setSuffix(" deg")
+        self.probe_type_title = QtWidgets.QLabel()
+        self.probe_type_tabs = QtWidgets.QTabBar()
+        self.probe_type_tabs.addTab("")
+        self.probe_type_tabs.addTab("")
 
         self.debug_start_title = QtWidgets.QLabel()
         self.debug_start_spin = QtWidgets.QDoubleSpinBox()
@@ -1035,15 +1064,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.debug_step_spin.setValue(5.0)
         self.debug_step_spin.setSuffix(" deg")
 
+        self.debug_sound_speed_title = QtWidgets.QLabel()
+        self.debug_sound_speed_spin = QtWidgets.QSpinBox()
+        self.debug_sound_speed_spin.setRange(100, 3000)
+        self.debug_sound_speed_spin.setValue(1500)
+        self.debug_sound_speed_spin.setSuffix(" m/s")
+
         self.sample_count_title = QtWidgets.QLabel()
         self.sample_count_spin = QtWidgets.QSpinBox()
-        self.sample_count_spin.setRange(32, 4096)
-        self.sample_count_spin.setValue(256)
+        self.sample_count_spin.setRange(32, 7500)
+        self.sample_count_spin.setValue(7500)
 
         self.capture_type_title = QtWidgets.QLabel()
         self.capture_type_combo = QtWidgets.QComboBox()
         self.capture_type_combo.addItem("Raw Wave", CaptureType.RAW_WAVE)
         self.capture_type_combo.addItem("Envelope", CaptureType.ENVELOPE)
+
+        self.pulse_count_title = QtWidgets.QLabel()
+        self.pulse_count_spin = QtWidgets.QSpinBox()
+        self.pulse_count_spin.setRange(1, 255)
+        self.pulse_count_spin.setValue(6)
 
         self.upload_distance_check = QtWidgets.QCheckBox("Upload distance")
         self.upload_distance_check.setChecked(True)
@@ -1051,22 +1091,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.upload_wave_check.setChecked(True)
 
         self.apply_single_config_button = QtWidgets.QPushButton()
-        self.move_button = QtWidgets.QPushButton()
         self.single_measure_button = QtWidgets.QPushButton()
         self.apply_sweep_config_button = QtWidgets.QPushButton()
         self.start_debug_sweep_button = QtWidgets.QPushButton()
         self.save_wave_button = QtWidgets.QPushButton()
 
-        control_form.addRow(self.target_angle_title, self.target_angle_spin)
+        control_form.addRow(self.probe_type_title, self.probe_type_tabs)
         control_form.addRow(self.debug_start_title, self.debug_start_spin)
         control_form.addRow(self.debug_end_title, self.debug_end_spin)
         control_form.addRow(self.debug_step_title, self.debug_step_spin)
+        control_form.addRow(self.debug_sound_speed_title, self.debug_sound_speed_spin)
         control_form.addRow(self.sample_count_title, self.sample_count_spin)
         control_form.addRow(self.capture_type_title, self.capture_type_combo)
+        control_form.addRow(self.pulse_count_title, self.pulse_count_spin)
         control_form.addRow(self.upload_distance_check)
         control_form.addRow(self.upload_wave_check)
         control_form.addRow(self.apply_single_config_button)
-        control_form.addRow(self.move_button)
         control_form.addRow(self.single_measure_button)
         control_form.addRow(self.apply_sweep_config_button)
         control_form.addRow(self.start_debug_sweep_button)
@@ -1091,10 +1131,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.debug_session_title = QtWidgets.QLabel()
         result_form.addRow(self.debug_session_title, self.debug_session_label)
 
-        self.wave_plot = pg.PlotWidget()
+        self.wave_distance_axis = DistanceAxisItem(parent=self)
+        self.wave_plot = pg.PlotWidget(axisItems={"top": self.wave_distance_axis})
         self.wave_plot.showGrid(x=True, y=True, alpha=0.25)
         self.wave_plot.setLabel("left", "Amplitude")
-        self.wave_plot.setLabel("bottom", "Sample")
+        self.wave_plot.setLabel("bottom", "Time (us)")
+        self.wave_plot.showAxis("top")
+        self.wave_plot.setLabel("top", "Distance (mm)")
         self.wave_curve = self.wave_plot.plot(pen=pg.mkPen("#9b2226", width=2))
 
         self.debug_sweep_plot = pg.PlotWidget()
@@ -1126,11 +1169,15 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setVerticalSpacing(8)
 
         self.apply_single_config_button.clicked.connect(self._configure_debug_single)
-        self.move_button.clicked.connect(self._move_to_angle)
         self.single_measure_button.clicked.connect(self._start_single_measure)
         self.apply_sweep_config_button.clicked.connect(self._configure_debug_sweep)
         self.start_debug_sweep_button.clicked.connect(self._start_debug_sweep)
         self.save_wave_button.clicked.connect(self._save_wave_csv)
+        self.probe_type_tabs.currentChanged.connect(self._handle_debug_probe_change)
+        self.debug_sound_speed_spin.valueChanged.connect(self._refresh_wave_plot_axes)
+        self.debug_start_spin.valueChanged.connect(self._normalize_debug_angle_inputs)
+        self.debug_end_spin.valueChanged.connect(self._normalize_debug_angle_inputs)
+        self._update_debug_probe_mode_ui()
         return tab
 
     def _tr(self, key: str, **kwargs: Any) -> str:
@@ -1189,17 +1236,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.debug_control_group.setTitle(self._tr("debug_controls"))
         self.debug_result_group.setTitle(self._tr("debug_state"))
-        self.target_angle_title.setText(self._tr("target_angle"))
+        self.probe_type_title.setText(self._tr("probe_type"))
+        self.probe_type_tabs.setTabText(0, self._tr("depth_probe"))
+        self.probe_type_tabs.setTabText(1, self._tr("rotary_probe"))
         self.debug_start_title.setText(self._tr("sweep_start"))
         self.debug_end_title.setText(self._tr("sweep_end"))
         self.debug_step_title.setText(self._tr("sweep_step"))
+        self.debug_sound_speed_title.setText(self._tr("debug_sound_speed"))
         self.sample_count_title.setText(self._tr("sample_count"))
         self.capture_type_title.setText(self._tr("capture_type"))
+        self.pulse_count_title.setText(self._tr("pulse_count"))
         self.upload_distance_check.setText(self._tr("upload_distance"))
         self.upload_wave_check.setText(self._tr("upload_wave"))
         self.apply_single_config_button.setText(self._tr("config_single"))
-        self.move_button.setText(self._tr("move_to_angle"))
-        self.single_measure_button.setText(self._tr("single_measure"))
+        self.single_measure_button.setText(
+            self._tr("test_button") if self.debug_probe_type == ProbeType.DEPTH_PROBE else self._tr("single_measure")
+        )
         self.apply_sweep_config_button.setText(self._tr("config_sweep"))
         self.start_debug_sweep_button.setText(self._tr("start_sweep"))
         self.save_wave_button.setText(self._tr("save_wave_csv"))
@@ -1222,6 +1274,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wave_info_label.setText(self._tr("wave", value=self._suffix_after_colon(self.wave_info_label.text())))
 
         self.wave_plot.setTitle(self._tr("wave_plot_title"))
+        self.wave_plot.setLabel("bottom", "Time (us)")
+        self.wave_plot.setLabel("top", "Distance (mm)")
         self.debug_sweep_plot.setTitle(self._tr("debug_sweep_plot_title"))
         if self.point_cloud_window is not None:
             self.point_cloud_window.set_title(self._tr("cloud_window_title"))
@@ -1231,6 +1285,56 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_ring_and_axial_labels()
         self._update_front_distance_label()
         self._update_point_cloud_status_label()
+        self._refresh_wave_plot_axes()
+
+    def _handle_tab_changed(self, index: int) -> None:
+        self._sync_mode_label()
+        if index == self.tabs.indexOf(self.debug_tab):
+            self._update_debug_probe_mode_ui()
+            self._notify_debug_mode_switch()
+
+    def _handle_debug_probe_change(self, index: int) -> None:
+        self.debug_probe_type = ProbeType.DEPTH_PROBE if index == 0 else ProbeType.ROTARY_DEBUG
+        self._update_debug_probe_mode_ui()
+        if self.tabs.currentWidget() == self.debug_tab:
+            self._notify_debug_mode_switch()
+
+    def _normalize_debug_angle_inputs(self) -> None:
+        if self.debug_probe_type == ProbeType.DEPTH_PROBE:
+            return
+        if self.debug_end_spin.value() < self.debug_start_spin.value():
+            self.debug_end_spin.blockSignals(True)
+            self.debug_end_spin.setValue(self.debug_start_spin.value())
+            self.debug_end_spin.blockSignals(False)
+
+    def _update_debug_probe_mode_ui(self) -> None:
+        depth_mode = self.debug_probe_type == ProbeType.DEPTH_PROBE
+        angle_widgets = (self.debug_start_spin, self.debug_end_spin, self.debug_step_spin)
+        for widget in angle_widgets:
+            widget.setEnabled(not depth_mode)
+        self.apply_sweep_config_button.setEnabled(not depth_mode and self.worker is not None and self.worker.isRunning())
+        self.start_debug_sweep_button.setEnabled(not depth_mode and self.worker is not None and self.worker.isRunning())
+        if depth_mode:
+            self.debug_start_spin.setValue(0.0)
+            self.debug_end_spin.setValue(0.0)
+            self.debug_step_spin.setValue(0.0)
+            self.upload_distance_check.setChecked(False)
+            self.upload_distance_check.setEnabled(False)
+        else:
+            self.upload_distance_check.setEnabled(True)
+            self._normalize_debug_angle_inputs()
+        self.sample_count_spin.setValue(7500)
+        self.sample_count_spin.setEnabled(False)
+        self.capture_type_combo.setCurrentIndex(0)
+        self.capture_type_combo.setEnabled(False)
+        self.single_measure_button.setText(
+            self._tr("test_button") if depth_mode else self._tr("single_measure")
+        )
+
+    def _notify_debug_mode_switch(self) -> None:
+        if self.worker is None or not self.worker.isRunning():
+            return
+        self._configure_debug_single()
 
     def _toggle_point_cloud_window(self, enabled: bool) -> None:
         if self.point_cloud_window is not None:
@@ -1345,9 +1449,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._send_packet(encode_start_scan(self._next_sequence()), "START_SCAN")
 
     def _configure_debug_single(self) -> None:
-        angle = int(round(self.target_angle_spin.value() * 100.0))
+        depth_mode = self.debug_probe_type == ProbeType.DEPTH_PROBE
+        angle = 0 if depth_mode else int(round(self.debug_start_spin.value() * 100.0))
         flags = 0x01
-        if self.upload_distance_check.isChecked():
+        if (not depth_mode) and self.upload_distance_check.isChecked():
             flags |= 0x04
         if self.upload_wave_check.isChecked():
             flags |= 0x08
@@ -1356,14 +1461,31 @@ class MainWindow(QtWidgets.QMainWindow):
             start_angle=angle,
             end_angle=angle,
             step_angle=0,
-            capture_type=CaptureType(self.capture_type_combo.currentData()),
-            sample_count=self.sample_count_spin.value(),
+            capture_type=CaptureType.RAW_WAVE,
+            probe_type=self.debug_probe_type,
+            sample_count=7500,
+            pulse_count=self.pulse_count_spin.value(),
             flags=flags,
         )
         self.debug_target_label.setText(self._tr("target", value=self._format_angle(angle)))
         self._send_packet(encode_debug_config(self._next_sequence(), config), "CONFIG_DEBUG(single)")
 
     def _configure_debug_sweep(self) -> None:
+        if self.debug_probe_type == ProbeType.DEPTH_PROBE:
+            self._append_log("Depth probe mode does not support sweep config.")
+            return
+        self._normalize_debug_angle_inputs()
+        start_angle = int(round(self.debug_start_spin.value() * 100.0))
+        end_angle = int(round(self.debug_end_spin.value() * 100.0))
+        step_angle = int(round(self.debug_step_spin.value() * 100.0))
+        if end_angle < start_angle:
+            self._append_log("Sweep config rejected: end angle must be >= start angle.")
+            return
+        if (end_angle > start_angle) and (step_angle == 0):
+            step_angle = 100
+            self.debug_step_spin.blockSignals(True)
+            self.debug_step_spin.setValue(1.0)
+            self.debug_step_spin.blockSignals(False)
         flags = 0x02
         if self.upload_distance_check.isChecked():
             flags |= 0x04
@@ -1371,17 +1493,22 @@ class MainWindow(QtWidgets.QMainWindow):
             flags |= 0x08
 
         config = DebugConfig(
-            start_angle=int(round(self.debug_start_spin.value() * 100.0)),
-            end_angle=int(round(self.debug_end_spin.value() * 100.0)),
-            step_angle=int(round(self.debug_step_spin.value() * 100.0)),
-            capture_type=CaptureType(self.capture_type_combo.currentData()),
-            sample_count=self.sample_count_spin.value(),
+            start_angle=start_angle,
+            end_angle=end_angle,
+            step_angle=step_angle,
+            capture_type=CaptureType.RAW_WAVE,
+            probe_type=self.debug_probe_type,
+            sample_count=7500,
+            pulse_count=self.pulse_count_spin.value(),
             flags=flags,
         )
         self._send_packet(encode_debug_config(self._next_sequence(), config), "CONFIG_DEBUG(sweep)")
 
     def _move_to_angle(self) -> None:
-        angle = int(round(self.target_angle_spin.value() * 100.0))
+        if self.debug_probe_type == ProbeType.DEPTH_PROBE:
+            self._append_log("Depth probe mode keeps the motor fixed.")
+            return
+        angle = int(round(self.debug_start_spin.value() * 100.0))
         self.debug_target_label.setText(self._tr("target", value=self._format_angle(angle)))
         self._send_packet(encode_move_to_angle(self._next_sequence(), angle), "MOVE_TO_ANGLE")
 
@@ -1389,19 +1516,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.debug_started_at = time.time()
         self.current_wave_bytes = b""
         self.current_wave_samples.clear()
+        self.current_wave_display_samples.clear()
         self.wave_streams.clear()
         self.wave_curve.setData([], [])
         self._set_mode("Debug Single")
         self.debug_session_label.setText("Single measure running.")
-        self._send_packet(encode_start_single_measure(self._next_sequence()), "START_SINGLE_MEASURE")
+        self._configure_debug_single()
+        QtCore.QTimer.singleShot(
+            120,
+            lambda: self._send_packet(encode_start_single_measure(self._next_sequence()), "START_SINGLE_MEASURE"),
+        )
 
     def _start_debug_sweep(self) -> None:
+        if self.debug_probe_type == ProbeType.DEPTH_PROBE:
+            self._append_log("Depth probe mode does not support debug sweep.")
+            return
         self.current_debug_points.clear()
         self.debug_started_at = time.time()
         self._reset_debug_views()
         self._set_mode("Debug Sweep")
         self.debug_session_label.setText("Debug sweep running.")
-        self._send_packet(encode_start_debug_sweep(self._next_sequence()), "START_DEBUG_SWEEP")
+        self._configure_debug_sweep()
+        QtCore.QTimer.singleShot(
+            120,
+            lambda: self._send_packet(encode_start_debug_sweep(self._next_sequence()), "START_DEBUG_SWEEP"),
+        )
 
     def _save_scan_csv(self) -> None:
         if self.scan_table.rowCount() == 0:
@@ -1470,9 +1609,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
         with open(path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["sample_index", "value"])
-            for index, value in enumerate(self.current_wave_samples):
-                writer.writerow([index, value])
+            if self.current_wave_data_type in (WaveDataType.U16_RAW, WaveDataType.U16_ENVELOPE):
+                writer.writerow(["sample_index", "time_us", "distance_mm", "raw_code", "voltage_v"])
+                for index, value in enumerate(self.current_wave_samples):
+                    time_us = self._sample_index_to_time_us(index)
+                    writer.writerow(
+                        [
+                            index,
+                            f"{time_us:.6f}",
+                            f"{self._time_us_to_distance_mm(time_us):.6f}",
+                            value,
+                            f"{(float(value) * ADC_REFERENCE_VOLTAGE / ADC_FULL_SCALE):.6f}",
+                        ]
+                    )
+            else:
+                writer.writerow(["sample_index", "time_us", "distance_mm", "value"])
+                for index, value in enumerate(self.current_wave_samples):
+                    time_us = self._sample_index_to_time_us(index)
+                    writer.writerow([index, f"{time_us:.6f}", f"{self._time_us_to_distance_mm(time_us):.6f}", value])
         self._append_log(f"Saved waveform CSV: {path}")
 
     def _send_packet(self, packet: bytes, label: str) -> None:
@@ -1499,6 +1653,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if message.startswith("Connected:"):
             self._set_transport_connected(True)
             QtCore.QTimer.singleShot(150, self._request_device_info)
+            if self.tabs.currentWidget() == self.debug_tab:
+                QtCore.QTimer.singleShot(260, self._notify_debug_mode_switch)
             return
 
         if message == "Disconnected":
@@ -1721,7 +1877,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_wave_data_type = data_type
         self.current_wave_bytes = raw_bytes
         self.current_wave_samples = self._decode_wave_samples(data_type, raw_bytes)
-        self.wave_curve.setData(list(range(len(self.current_wave_samples))), self.current_wave_samples)
+        self.current_wave_display_samples = self._wave_samples_to_display(data_type, self.current_wave_samples)
+        x_values = [self._sample_index_to_time_us(index) for index in range(len(self.current_wave_display_samples))]
+        self.wave_curve.setData(x_values, self.current_wave_display_samples)
+        self.wave_plot.setLabel("left", self._wave_axis_label(data_type))
+        self._refresh_wave_plot_axes()
         self.wave_info_label.setText(
             self._tr(
                 "wave",
@@ -1994,10 +2154,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.configure_scan_button.setEnabled(connected)
         self.start_scan_button.setEnabled(connected)
         self.apply_single_config_button.setEnabled(connected)
-        self.move_button.setEnabled(connected)
         self.single_measure_button.setEnabled(connected)
         self.apply_sweep_config_button.setEnabled(connected)
         self.start_debug_sweep_button.setEnabled(connected)
+        self._update_debug_probe_mode_ui()
         if not connected:
             self.connection_label.setText(self._tr("disconnected"))
 
@@ -2167,6 +2327,25 @@ class MainWindow(QtWidgets.QMainWindow):
             return []
         count = len(raw_bytes) // 2
         return list(struct.unpack(f"<{count}H", raw_bytes[: count * 2]))
+
+    def _wave_samples_to_display(self, data_type: WaveDataType, samples: list[int]) -> list[float]:
+        if data_type in (WaveDataType.U16_RAW, WaveDataType.U16_ENVELOPE):
+            return [(float(value) * ADC_REFERENCE_VOLTAGE / ADC_FULL_SCALE) for value in samples]
+        return [float(value) for value in samples]
+
+    def _wave_axis_label(self, data_type: WaveDataType) -> str:
+        if data_type in (WaveDataType.U16_RAW, WaveDataType.U16_ENVELOPE):
+            return "Voltage (V)"
+        return "Amplitude"
+
+    def _sample_index_to_time_us(self, index: int) -> float:
+        return (float(index) / WAVE_SAMPLE_RATE_HZ) * 1_000_000.0
+
+    def _time_us_to_distance_mm(self, time_us: float) -> float:
+        return time_us * float(self.debug_sound_speed_spin.value()) / 2000.0
+
+    def _refresh_wave_plot_axes(self) -> None:
+        self.wave_plot.getPlotItem().getAxis("top").update()
 
     def _decode_frame_bytes(self, packet: bytes) -> Frame | None:
         decoder = FrameDecoder()
