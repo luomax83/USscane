@@ -19,6 +19,7 @@
 #include <math.h>
 #include <string.h>
 
+#include "motor_driver.h"
 #include "sonar_app.h"
 #include "sonar_protocol.h"
 /* USER CODE END Includes */
@@ -29,20 +30,36 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define ZEROING_DURATION_MS 800U
 #define SCAN_POINT_INTERVAL_MS 60U
 #define DEVICE_INFO_BROADCAST_MS 10000U
 #define UART_STREAM_BUFFER_SIZE 512U
 #define UART_TX_FRAME_BUFFER_SIZE 1040U
 #define WAVE_CHUNK_DATA_SIZE 240U
 #define DEPTH_SAMPLE_COUNT 7500U
-#define DEPTH_BUFFER_COUNT 2U
+#define DEPTH_BUFFER_COUNT 1U
 #define DEPTH_BUFFER_INVALID 0xFFU
 #define DEPTH_DEFAULT_PULSE_COUNT 6U
 #define DEPTH_PROBE_500KHZ_PERIOD 80U
 #define DEPTH_PROBE_500KHZ_PULSE (DEPTH_PROBE_500KHZ_PERIOD / 2U)
 #define DEBUG_PROBE_TYPE_SIDE_SCAN 0x00U
 #define DEBUG_PROBE_TYPE_DEPTH 0x01U
+#define MOTOR_SLAVE_ADDRESS 0x01U
+#define MOTOR_SINGLE_TURN_STEPS 6400U
+#define MOTOR_MOVE_SPEED_RPM 100U
+#define MOTOR_HOME_SPEED_RPM 100U
+#define MOTOR_MOTION_TIMEOUT_MS 15000U
+#define MOTOR_FORWARD_START_SPEED_RPM_X10 300U
+#define MOTOR_FORWARD_MAX_SPEED_RPM 500U
+#define MOTOR_FORWARD_ACCEL_TIME_MS 250U
+#define MOTOR_FORWARD_TOLERANCE_STEPS 50U
+#define MOTOR_STOP_STABLE_POLLS 4U
+#define MOTOR_TARGET_STABLE_POLLS 3U
+#define MOTOR_STABLE_STEP_TOLERANCE 4U
+#define MOTOR_TARGET_STEP_TOLERANCE 16U
+#define MOTOR_SIDE_SCAN_ANGLE_QUANTUM_CDEG 180U
+#define MOTOR_MIN_SIDE_SCAN_STEP_CDEG MOTOR_SIDE_SCAN_ANGLE_QUANTUM_CDEG
+#define MOTOR_MAX_SIDE_SCAN_STEP_CDEG 1980U
+#define MOTOR_DEFAULT_SIDE_SCAN_STEP_CDEG 540U
 #define DEVICE_SERIAL_NUMBER "H743-EMU-001"
 #define APP_PI_F 3.14159265358979323846f
 #define APP_CAPABILITY_SCAN (1UL << 0)
@@ -113,9 +130,6 @@ static uint16_t g_scan_point_index = 0U;
 static uint16_t g_scan_point_count = 0U;
 static uint16_t g_scan_cycle = 0U;
 static uint16_t g_active_scan_sequence = 0U;
-static uint16_t g_pending_zero_sequence = 0U;
-static uint8_t g_pending_zero_command = 0U;
-static uint8_t g_pending_zero_valid = 0U;
 static uint32_t g_last_device_info_broadcast_ms = 0U;
 static uint16_t g_active_measure_sequence = 0U;
 static volatile uint8_t g_depth_capture_active = 0U;
@@ -128,12 +142,20 @@ static volatile uint8_t g_depth_capture_buffer_index = DEPTH_BUFFER_INVALID;
 static volatile uint8_t g_depth_completed_buffer_index = DEPTH_BUFFER_INVALID;
 static volatile uint8_t g_depth_timeout_buffer_index = DEPTH_BUFFER_INVALID;
 static uint8_t g_depth_buffer_round_robin = 0U;
+static MotorDriverContext g_motor_driver;
 volatile uint32_t g_debug_capture_request = 0U;
 volatile uint32_t g_debug_capture_done = 0U;
 volatile uint32_t g_debug_capture_result = 0U;
 volatile uint32_t g_debug_upload_stage = 0U;
 volatile uint32_t g_debug_upload_chunks = 0U;
 volatile uint32_t g_debug_fault_marker = 0U;
+volatile uint32_t g_debug_motor_request = 0U;
+volatile uint32_t g_debug_motor_done = 0U;
+volatile uint32_t g_debug_motor_result = 0U;
+volatile uint32_t g_debug_motor_status = 0U;
+volatile int32_t g_debug_motor_actual_steps = 0;
+volatile uint32_t g_debug_motor_target_angle = 0U;
+volatile uint32_t g_debug_motor_arrived_angle = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -146,6 +168,7 @@ static void App_PollUartReception(void);
 static void App_ProcessProtocol(void);
 static void App_ProcessStateMachine(void);
 static void App_ProcessDeviceInfoBroadcast(void);
+static void App_ProcessMotorDiagnostic(void);
 static void App_DispatchFrame(uint8_t command, uint16_t sequence, const uint8_t *payload, uint16_t payload_length);
 static void App_HandleGetDeviceInfo(uint16_t sequence);
 static void App_HandleZeroing(uint16_t sequence);
@@ -157,17 +180,21 @@ static void App_HandleStartSingleMeasure(uint16_t sequence);
 static void App_HandleStartDebugSweep(uint16_t sequence);
 static void App_HandleStop(uint16_t sequence);
 static void App_StartZeroing(uint16_t sequence, uint8_t ref_command);
-static void App_FinishZeroing(void);
 static void App_FinishScan(uint8_t end_reason);
 static void App_SendFrame(uint8_t command, uint16_t sequence, const uint8_t *payload, uint16_t payload_length);
 static void App_SendAck(uint16_t sequence, uint8_t ref_command, const uint8_t *detail, uint8_t detail_length);
 static void App_SendNack(uint16_t sequence, uint8_t ref_command, SonarResultCode result);
+static uint16_t App_AppendMotorTrace(uint8_t *payload, uint16_t payload_length, uint16_t payload_capacity);
 static void App_SendStatusEvent(uint8_t event, uint16_t detail);
 static void App_SendScanPoint(uint16_t point_index);
 static void App_SendDebugSweepPoint(uint16_t sequence, uint16_t point_index, uint16_t angle, uint32_t distance, uint16_t quality, uint8_t has_wave);
 static uint16_t App_GetScanPointCount(uint16_t scan_step);
 static uint32_t App_GenerateDistance(uint16_t angle);
 static uint32_t App_GenerateDistanceForAngle(uint16_t angle, uint32_t base, uint32_t span, float phase_shift);
+static uint32_t App_CalculateDistanceMmFromSamples(const uint16_t *samples, uint16_t sample_count, uint16_t sound_speed_m_s);
+static void App_SendWaveFromBuffer(uint16_t sequence, uint16_t angle, uint8_t buffer_index, uint16_t sample_count);
+static SonarResultCode App_RunBlockingMeasurement(uint16_t sequence, uint16_t angle, uint8_t upload_wave, uint32_t *distance_mm, uint16_t *quality);
+static SonarResultCode App_CaptureSweepMeasurement(uint16_t sequence, uint32_t *distance_mm, uint16_t *quality, uint8_t upload_wave, uint8_t *buffer_index);
 static uint8_t App_ComputeMoveDirection(uint16_t current_angle, uint16_t target_angle);
 static void App_WriteU16(uint8_t *target, uint16_t value);
 static void App_WriteU32(uint8_t *target, uint32_t value);
@@ -179,6 +206,26 @@ static void App_StartDepthCapture(uint16_t sequence);
 static void App_StopDepthCapture(void);
 static void App_FinalizeDepthCapture(void);
 static void App_ProcessDepthUpload(void);
+static void App_InitMotorController(void);
+static SonarResultCode App_MotorResultToSonarResult(MotorDriverResult result);
+static SonarResultCode App_AcceptMotorWriteResult(MotorDriverResult result);
+static uint16_t App_GetDefaultSideScanStepCdeg(void);
+static uint16_t App_ClampSideScanStepCdeg(uint16_t step_cdeg);
+static uint16_t App_NormalizeSideScanAngleCdeg(uint16_t angle_cdeg);
+static uint16_t App_NormalizeMotorAngleCdeg(uint16_t angle_cdeg);
+static uint16_t App_NormalizeMotorStepCdeg(uint16_t step_cdeg);
+static SonarResultCode App_UpdateCurrentAngleFromMotor(void);
+static uint16_t App_ComputeSingleTurnStepDelta(uint16_t lhs, uint16_t rhs);
+static SonarResultCode App_WaitMotorForStopBySteps(uint32_t timeout_ms, uint16_t *arrived_angle);
+static SonarResultCode App_WaitMotorForTargetBySteps(uint16_t target_angle, uint32_t timeout_ms, uint16_t *arrived_angle);
+static SonarResultCode App_ZeroMotorBlocking(void);
+static SonarResultCode App_MoveMotorToAngleBlocking(uint16_t target_angle, uint8_t *move_dir, uint16_t *arrived_angle);
+static SonarResultCode App_MoveMotorByAngleDeltaBlocking(int32_t angle_delta_cdeg, uint16_t *arrived_angle);
+static uint32_t App_EstimateMotorMoveWaitMs(int32_t step_delta, uint16_t speed_rpm, uint16_t accel_time_ms);
+static void App_ServiceBackgroundTasks(uint32_t duration_ms);
+static void App_FlushDepthUploads(uint32_t timeout_ms);
+static uint8_t App_HasFreeDepthBuffer(void);
+static uint8_t App_WaitForFreeDepthBuffer(uint32_t timeout_ms);
 static uint8_t App_IsDepthProbeMode(void);
 static uint8_t App_IsSideScanProbeMode(void);
 static uint32_t App_DCacheAlignDown(uint32_t address);
@@ -300,7 +347,7 @@ static void App_ProcessStateMachine(void)
 
   if ((g_debug_capture_request != 0U) &&
       (g_depth_capture_active == 0U) &&
-      ((g_sonar_app.status == SONAR_STATUS_IDLE) || (g_sonar_app.status == SONAR_STATUS_READY)))
+      ((g_sonar_app.status == SONAR_STATUS_IDLE) || (g_sonar_app.status == SONAR_STATUS_READY) || (g_sonar_app.status == SONAR_STATUS_ERROR)))
   {
     g_debug_capture_request = 0U;
     g_debug_capture_done = 0U;
@@ -319,11 +366,6 @@ static void App_ProcessStateMachine(void)
     g_sonar_app.status = SONAR_STATUS_MEASURING;
     g_active_measure_sequence = 0U;
     App_StartDepthCapture(0U);
-  }
-
-  if ((g_sonar_app.status == SONAR_STATUS_ZEROING) && ((now - g_state_entered_ms) >= ZEROING_DURATION_MS))
-  {
-    App_FinishZeroing();
   }
 
   if ((g_sonar_app.status == SONAR_STATUS_SCANNING) && ((now - g_scan_last_emit_ms) >= SCAN_POINT_INTERVAL_MS))
@@ -362,6 +404,7 @@ static void App_ProcessStateMachine(void)
   }
 
   App_ProcessDepthUpload();
+  App_ProcessMotorDiagnostic();
   SonarApp_Process(&g_sonar_app, now);
 }
 
@@ -384,6 +427,456 @@ static void App_ProcessDeviceInfoBroadcast(void)
     g_last_device_info_broadcast_ms = now;
     App_SendAck(0U, SONAR_CMD_GET_DEVICE_INFO, detail, detail_length);
   }
+}
+
+static void App_ProcessMotorDiagnostic(void)
+{
+  uint32_t request = g_debug_motor_request;
+  SonarResultCode result = SONAR_RESULT_OK;
+  uint8_t move_dir = 0U;
+  uint16_t arrived_angle = 0U;
+
+  if (request == 0U)
+  {
+    return;
+  }
+
+  g_debug_motor_request = 0U;
+  g_debug_motor_done = 0U;
+  g_debug_motor_result = 0U;
+  g_debug_motor_status = 0U;
+  g_debug_motor_actual_steps = 0;
+  g_debug_motor_arrived_angle = 0U;
+
+  switch (request)
+  {
+    case 1U:
+    {
+      uint16_t status = 0U;
+      MotorDriverResult driver_result = MotorDriver_ReadStatus(&g_motor_driver, &status);
+      g_debug_motor_status = status;
+      g_debug_motor_result = (uint32_t)driver_result;
+      break;
+    }
+    case 2U:
+    {
+      int32_t actual_steps = 0;
+      MotorDriverResult driver_result = MotorDriver_ReadActualSteps(&g_motor_driver, &actual_steps);
+      g_debug_motor_actual_steps = actual_steps;
+      g_debug_motor_result = (uint32_t)driver_result;
+      break;
+    }
+    case 3U:
+      result = App_MoveMotorToAngleBlocking((uint16_t)g_debug_motor_target_angle, &move_dir, &arrived_angle);
+      g_debug_motor_arrived_angle = arrived_angle;
+      g_debug_motor_result = (uint32_t)result;
+      break;
+    case 4U:
+      result = App_ZeroMotorBlocking();
+      g_debug_motor_result = (uint32_t)result;
+      break;
+    default:
+      g_debug_motor_result = 0xEEEE0000UL | request;
+      break;
+  }
+
+  g_debug_motor_done = 1U;
+}
+
+static void App_InitMotorController(void)
+{
+  int32_t actual_steps = 0;
+
+  MotorDriver_Init(&g_motor_driver, &huart4, MOTOR_SLAVE_ADDRESS, MOTOR_SINGLE_TURN_STEPS);
+  g_motor_driver.response_timeout_ms = 1000U;
+  HAL_Delay(100U);
+
+  if (MotorDriver_ReadActualSteps(&g_motor_driver, &actual_steps) == MOTOR_DRIVER_OK)
+  {
+    g_sonar_app.current_angle = MotorDriver_SingleTurnStepsToAngleCdeg(
+        &g_motor_driver,
+        MotorDriver_ActualStepsToSingleTurnSteps(&g_motor_driver, actual_steps));
+    g_sonar_app.target_angle = g_sonar_app.current_angle;
+  }
+  else
+  {
+    g_sonar_app.current_angle = 0U;
+    g_sonar_app.target_angle = 0U;
+  }
+}
+
+static SonarResultCode App_MotorResultToSonarResult(MotorDriverResult result)
+{
+  switch (result)
+  {
+    case MOTOR_DRIVER_OK:
+      return SONAR_RESULT_OK;
+    case MOTOR_DRIVER_TIMEOUT:
+      return SONAR_RESULT_TIMEOUT;
+    case MOTOR_DRIVER_INVALID_PARAM:
+      return SONAR_RESULT_INVALID_PARAM;
+    case MOTOR_DRIVER_MOTION_ERROR:
+      return SONAR_RESULT_FAIL;
+    case MOTOR_DRIVER_UART_ERROR:
+    case MOTOR_DRIVER_PROTOCOL_ERROR:
+    case MOTOR_DRIVER_REMOTE_ERROR:
+    default:
+      return SONAR_RESULT_HARDWARE_ERROR;
+  }
+}
+
+static SonarResultCode App_AcceptMotorWriteResult(MotorDriverResult result)
+{
+  if ((result == MOTOR_DRIVER_OK) || (result == MOTOR_DRIVER_TIMEOUT))
+  {
+    return SONAR_RESULT_OK;
+  }
+
+  return App_MotorResultToSonarResult(result);
+}
+
+static uint16_t App_GetDefaultSideScanStepCdeg(void)
+{
+  return App_NormalizeMotorStepCdeg(MOTOR_DEFAULT_SIDE_SCAN_STEP_CDEG);
+}
+
+static uint16_t App_ClampSideScanStepCdeg(uint16_t step_cdeg)
+{
+  if (step_cdeg < MOTOR_MIN_SIDE_SCAN_STEP_CDEG)
+  {
+    step_cdeg = MOTOR_MIN_SIDE_SCAN_STEP_CDEG;
+  }
+
+  if (step_cdeg > MOTOR_MAX_SIDE_SCAN_STEP_CDEG)
+  {
+    step_cdeg = MOTOR_MAX_SIDE_SCAN_STEP_CDEG;
+  }
+
+  return App_NormalizeMotorStepCdeg(step_cdeg);
+}
+
+static uint16_t App_NormalizeSideScanAngleCdeg(uint16_t angle_cdeg)
+{
+  uint32_t normalized = angle_cdeg % 36000U;
+  normalized = ((normalized + (MOTOR_SIDE_SCAN_ANGLE_QUANTUM_CDEG / 2U)) / MOTOR_SIDE_SCAN_ANGLE_QUANTUM_CDEG) * MOTOR_SIDE_SCAN_ANGLE_QUANTUM_CDEG;
+  if (normalized >= 36000U)
+  {
+    normalized = 0U;
+  }
+  return (uint16_t)normalized;
+}
+
+static uint16_t App_NormalizeMotorAngleCdeg(uint16_t angle_cdeg)
+{
+  return MotorDriver_NormalizeAngleCdeg(&g_motor_driver, angle_cdeg);
+}
+
+static uint16_t App_NormalizeMotorStepCdeg(uint16_t step_cdeg)
+{
+  uint16_t normalized = MotorDriver_NormalizeStepCdeg(&g_motor_driver, step_cdeg);
+
+  if ((step_cdeg != 0U) && (normalized == 0U))
+  {
+    normalized = MotorDriver_SingleTurnStepsToAngleCdeg(&g_motor_driver, 1U);
+  }
+
+  return normalized;
+}
+
+static SonarResultCode App_UpdateCurrentAngleFromMotor(void)
+{
+  int32_t actual_steps = 0;
+  MotorDriverResult result = MotorDriver_ReadActualSteps(&g_motor_driver, &actual_steps);
+
+  if (result != MOTOR_DRIVER_OK)
+  {
+    return App_MotorResultToSonarResult(result);
+  }
+
+  g_sonar_app.current_angle = MotorDriver_SingleTurnStepsToAngleCdeg(
+      &g_motor_driver,
+      MotorDriver_ActualStepsToSingleTurnSteps(&g_motor_driver, actual_steps));
+  return SONAR_RESULT_OK;
+}
+
+static uint16_t App_ComputeSingleTurnStepDelta(uint16_t lhs, uint16_t rhs)
+{
+  uint16_t delta = (lhs > rhs) ? (uint16_t)(lhs - rhs) : (uint16_t)(rhs - lhs);
+
+  if (delta > (MOTOR_SINGLE_TURN_STEPS / 2U))
+  {
+    delta = (uint16_t)(MOTOR_SINGLE_TURN_STEPS - delta);
+  }
+
+  return delta;
+}
+
+static SonarResultCode App_WaitMotorForStopBySteps(uint32_t timeout_ms, uint16_t *arrived_angle)
+{
+  uint32_t started_ms = HAL_GetTick();
+  uint16_t stable_polls = 0U;
+  uint16_t last_steps = 0U;
+  uint8_t has_last_steps = 0U;
+
+  HAL_Delay(150U);
+
+  while ((HAL_GetTick() - started_ms) < timeout_ms)
+  {
+    int32_t actual_steps = 0;
+    uint16_t current_steps = 0U;
+    uint16_t status = 0U;
+    MotorDriverResult status_result = MotorDriver_ReadStatus(&g_motor_driver, &status);
+
+    if (status_result != MOTOR_DRIVER_OK)
+    {
+      return App_MotorResultToSonarResult(status_result);
+    }
+
+    if (MotorDriver_ReadActualSteps(&g_motor_driver, &actual_steps) != MOTOR_DRIVER_OK)
+    {
+      return SONAR_RESULT_HARDWARE_ERROR;
+    }
+
+    current_steps = MotorDriver_ActualStepsToSingleTurnSteps(&g_motor_driver, actual_steps);
+    g_sonar_app.current_angle = MotorDriver_SingleTurnStepsToAngleCdeg(&g_motor_driver, current_steps);
+
+    if (has_last_steps != 0U)
+    {
+      if (App_ComputeSingleTurnStepDelta(current_steps, last_steps) <= MOTOR_STABLE_STEP_TOLERANCE)
+      {
+        stable_polls++;
+      }
+      else
+      {
+        stable_polls = 0U;
+      }
+    }
+
+    last_steps = current_steps;
+    has_last_steps = 1U;
+
+    if ((status == 0U) && (stable_polls >= MOTOR_STOP_STABLE_POLLS))
+    {
+      if (arrived_angle != NULL)
+      {
+        *arrived_angle = g_sonar_app.current_angle;
+      }
+      return SONAR_RESULT_OK;
+    }
+
+    HAL_Delay(60U);
+  }
+
+  return SONAR_RESULT_TIMEOUT;
+}
+
+static SonarResultCode App_WaitMotorForTargetBySteps(uint16_t target_angle, uint32_t timeout_ms, uint16_t *arrived_angle)
+{
+  uint32_t started_ms = HAL_GetTick();
+  uint16_t target_steps = MotorDriver_AngleCdegToSingleTurnSteps(&g_motor_driver, target_angle);
+  uint16_t stable_polls = 0U;
+
+  HAL_Delay(120U);
+
+  while ((HAL_GetTick() - started_ms) < timeout_ms)
+  {
+    int32_t actual_steps = 0;
+    uint16_t current_steps = 0U;
+    uint16_t status = 0U;
+    MotorDriverResult status_result = MotorDriver_ReadStatus(&g_motor_driver, &status);
+
+    if (status_result != MOTOR_DRIVER_OK)
+    {
+      return App_MotorResultToSonarResult(status_result);
+    }
+
+    if (MotorDriver_ReadActualSteps(&g_motor_driver, &actual_steps) != MOTOR_DRIVER_OK)
+    {
+      return SONAR_RESULT_HARDWARE_ERROR;
+    }
+
+    current_steps = MotorDriver_ActualStepsToSingleTurnSteps(&g_motor_driver, actual_steps);
+    g_sonar_app.current_angle = MotorDriver_SingleTurnStepsToAngleCdeg(&g_motor_driver, current_steps);
+
+    if (App_ComputeSingleTurnStepDelta(current_steps, target_steps) <= MOTOR_TARGET_STEP_TOLERANCE)
+    {
+      stable_polls++;
+      if ((status == 0U) && (stable_polls >= MOTOR_TARGET_STABLE_POLLS))
+      {
+        if (arrived_angle != NULL)
+        {
+          *arrived_angle = g_sonar_app.current_angle;
+        }
+        return SONAR_RESULT_OK;
+      }
+    }
+    else
+    {
+      stable_polls = 0U;
+    }
+
+    HAL_Delay(50U);
+  }
+
+  return SONAR_RESULT_TIMEOUT;
+}
+
+static SonarResultCode App_ZeroMotorBlocking(void)
+{
+  MotorDriverResult result = MotorDriver_Home(&g_motor_driver, MOTOR_HOME_SPEED_RPM);
+
+  if (App_AcceptMotorWriteResult(result) != SONAR_RESULT_OK)
+  {
+    return App_MotorResultToSonarResult(result);
+  }
+
+  HAL_Delay(5000U);
+  result = MotorDriver_SetZero(&g_motor_driver);
+  if (App_AcceptMotorWriteResult(result) != SONAR_RESULT_OK)
+  {
+    return App_MotorResultToSonarResult(result);
+  }
+
+  HAL_Delay(200U);
+  g_sonar_app.current_angle = 0U;
+  g_sonar_app.target_angle = 0U;
+  return SONAR_RESULT_OK;
+}
+
+static SonarResultCode App_MoveMotorToAngleBlocking(uint16_t target_angle, uint8_t *move_dir, uint16_t *arrived_angle)
+{
+  uint16_t normalized_angle = App_NormalizeMotorAngleCdeg(target_angle);
+  uint16_t motor_steps = 0U;
+  uint16_t current_angle = g_sonar_app.current_angle;
+  MotorDriverResult result = MOTOR_DRIVER_OK;
+
+  if (move_dir != NULL)
+  {
+    *move_dir = App_ComputeMoveDirection(current_angle, normalized_angle);
+  }
+
+  if (normalized_angle == current_angle)
+  {
+    g_sonar_app.target_angle = normalized_angle;
+    if (arrived_angle != NULL)
+    {
+      *arrived_angle = normalized_angle;
+    }
+    return SONAR_RESULT_OK;
+  }
+
+  motor_steps = MotorDriver_AngleCdegToSingleTurnSteps(&g_motor_driver, normalized_angle);
+  result = MotorDriver_MoveSingleTurn(&g_motor_driver, motor_steps, MOTOR_MOVE_SPEED_RPM, 0U);
+  if (App_AcceptMotorWriteResult(result) != SONAR_RESULT_OK)
+  {
+    return App_MotorResultToSonarResult(result);
+  }
+
+  App_ServiceBackgroundTasks(App_EstimateMotorMoveWaitMs(
+      (int32_t)MotorDriver_AngleCdegToSingleTurnSteps(&g_motor_driver, normalized_angle) -
+      (int32_t)MotorDriver_AngleCdegToSingleTurnSteps(&g_motor_driver, current_angle),
+      MOTOR_MOVE_SPEED_RPM,
+      200U));
+  g_sonar_app.current_angle = normalized_angle;
+  g_sonar_app.target_angle = normalized_angle;
+  if (arrived_angle != NULL)
+  {
+    *arrived_angle = normalized_angle;
+  }
+  return SONAR_RESULT_OK;
+}
+
+static SonarResultCode App_MoveMotorByAngleDeltaBlocking(int32_t angle_delta_cdeg, uint16_t *arrived_angle)
+{
+  int64_t step_delta = 0;
+  uint32_t wait_ms = 0U;
+  int32_t target_angle = 0;
+  MotorDriverResult result = MOTOR_DRIVER_OK;
+
+  if (angle_delta_cdeg == 0)
+  {
+    if (arrived_angle != NULL)
+    {
+      *arrived_angle = g_sonar_app.current_angle;
+    }
+    return SONAR_RESULT_OK;
+  }
+
+  step_delta = ((int64_t)angle_delta_cdeg * (int64_t)MOTOR_SINGLE_TURN_STEPS) / 36000LL;
+  if (step_delta == 0)
+  {
+    step_delta = (angle_delta_cdeg > 0) ? 1 : -1;
+  }
+
+  result = MotorDriver_MoveForwardSteps(
+      &g_motor_driver,
+      (int32_t)step_delta,
+      MOTOR_FORWARD_START_SPEED_RPM_X10,
+      MOTOR_FORWARD_MAX_SPEED_RPM,
+      MOTOR_FORWARD_ACCEL_TIME_MS,
+      MOTOR_FORWARD_TOLERANCE_STEPS);
+  if (App_AcceptMotorWriteResult(result) != SONAR_RESULT_OK)
+  {
+    return App_MotorResultToSonarResult(result);
+  }
+
+  wait_ms = App_EstimateMotorMoveWaitMs((int32_t)step_delta, MOTOR_FORWARD_MAX_SPEED_RPM, MOTOR_FORWARD_ACCEL_TIME_MS);
+  App_ServiceBackgroundTasks(wait_ms);
+  target_angle = (int32_t)g_sonar_app.current_angle + angle_delta_cdeg;
+  while (target_angle < 0)
+  {
+    target_angle += 36000;
+  }
+  target_angle %= 36000;
+  g_sonar_app.current_angle = App_NormalizeMotorAngleCdeg((uint16_t)target_angle);
+  if (arrived_angle != NULL)
+  {
+    *arrived_angle = g_sonar_app.current_angle;
+  }
+
+  return SONAR_RESULT_OK;
+}
+
+static uint32_t App_EstimateMotorMoveWaitMs(int32_t step_delta, uint16_t speed_rpm, uint16_t accel_time_ms)
+{
+  uint32_t abs_steps = 0U;
+  uint32_t speed_steps_per_second = 0U;
+  uint32_t move_time_ms = 0U;
+
+  if (step_delta < 0)
+  {
+    abs_steps = (uint32_t)(-step_delta);
+  }
+  else
+  {
+    abs_steps = (uint32_t)step_delta;
+  }
+
+  if (speed_rpm == 0U)
+  {
+    speed_rpm = 100U;
+  }
+
+  speed_steps_per_second = ((uint32_t)speed_rpm * MOTOR_SINGLE_TURN_STEPS) / 60U;
+  if (speed_steps_per_second == 0U)
+  {
+    speed_steps_per_second = 1U;
+  }
+
+  move_time_ms = (abs_steps * 1000U) / speed_steps_per_second;
+  move_time_ms += accel_time_ms;
+  move_time_ms += 200U;
+
+  if (move_time_ms < 300U)
+  {
+    move_time_ms = 300U;
+  }
+  if (move_time_ms > MOTOR_MOTION_TIMEOUT_MS)
+  {
+    move_time_ms = MOTOR_MOTION_TIMEOUT_MS;
+  }
+
+  return move_time_ms;
 }
 
 static void App_DispatchFrame(uint8_t command, uint16_t sequence, const uint8_t *payload, uint16_t payload_length)
@@ -454,7 +947,7 @@ static void App_HandleConfigScan(uint16_t sequence, const uint8_t *payload, uint
     return;
   }
 
-  if ((g_sonar_app.status != SONAR_STATUS_IDLE) && (g_sonar_app.status != SONAR_STATUS_READY))
+  if ((g_sonar_app.status != SONAR_STATUS_IDLE) && (g_sonar_app.status != SONAR_STATUS_READY) && (g_sonar_app.status != SONAR_STATUS_ERROR))
   {
     App_SendNack(sequence, SONAR_CMD_CONFIG_SCAN, SONAR_RESULT_INVALID_STATE);
     return;
@@ -465,6 +958,7 @@ static void App_HandleConfigScan(uint16_t sequence, const uint8_t *payload, uint
   medium = payload[4];
   flags = payload[5];
 
+  scan_step = App_NormalizeMotorStepCdeg(scan_step);
   if ((scan_step == 0U) || (scan_step > 36000U) || (sound_speed < 100U) || (sound_speed > 3000U) || (medium > 3U))
   {
     App_SendNack(sequence, SONAR_CMD_CONFIG_SCAN, SONAR_RESULT_INVALID_PARAM);
@@ -483,6 +977,9 @@ static void App_HandleConfigScan(uint16_t sequence, const uint8_t *payload, uint
 static void App_HandleConfigDebug(uint16_t sequence, const uint8_t *payload, uint16_t payload_length)
 {
   uint8_t detail[2] = {1U, 1U};
+  uint16_t original_start = 0U;
+  uint16_t original_end = 0U;
+  uint16_t original_step = 0U;
 
   if ((payload_length != 9U) && (payload_length != 10U) && (payload_length != 12U))
   {
@@ -490,7 +987,7 @@ static void App_HandleConfigDebug(uint16_t sequence, const uint8_t *payload, uin
     return;
   }
 
-  if ((g_sonar_app.status != SONAR_STATUS_IDLE) && (g_sonar_app.status != SONAR_STATUS_READY))
+  if ((g_sonar_app.status != SONAR_STATUS_IDLE) && (g_sonar_app.status != SONAR_STATUS_READY) && (g_sonar_app.status != SONAR_STATUS_ERROR))
   {
     App_SendNack(sequence, SONAR_CMD_CONFIG_DEBUG, SONAR_RESULT_INVALID_STATE);
     return;
@@ -499,6 +996,9 @@ static void App_HandleConfigDebug(uint16_t sequence, const uint8_t *payload, uin
   g_sonar_app.debug_config.start_angle = App_ReadU16(&payload[0]);
   g_sonar_app.debug_config.end_angle = App_ReadU16(&payload[2]);
   g_sonar_app.debug_config.step_angle = App_ReadU16(&payload[4]);
+  original_start = g_sonar_app.debug_config.start_angle;
+  original_end = g_sonar_app.debug_config.end_angle;
+  original_step = g_sonar_app.debug_config.step_angle;
   g_sonar_app.debug_config.capture_type = payload[6];
   if (payload_length >= 12U)
   {
@@ -540,10 +1040,20 @@ static void App_HandleConfigDebug(uint16_t sequence, const uint8_t *payload, uin
       return;
     }
 
+    g_sonar_app.debug_config.start_angle = App_NormalizeSideScanAngleCdeg(g_sonar_app.debug_config.start_angle);
+    g_sonar_app.debug_config.end_angle = App_NormalizeSideScanAngleCdeg(g_sonar_app.debug_config.end_angle);
+    if (g_sonar_app.debug_config.end_angle < g_sonar_app.debug_config.start_angle)
+    {
+      g_sonar_app.debug_config.end_angle = g_sonar_app.debug_config.start_angle;
+    }
     if ((g_sonar_app.debug_config.end_angle > g_sonar_app.debug_config.start_angle) &&
         (g_sonar_app.debug_config.step_angle == 0U))
     {
-      g_sonar_app.debug_config.step_angle = 100U;
+      g_sonar_app.debug_config.step_angle = App_GetDefaultSideScanStepCdeg();
+    }
+    else if (g_sonar_app.debug_config.step_angle > 0U)
+    {
+      g_sonar_app.debug_config.step_angle = App_ClampSideScanStepCdeg(g_sonar_app.debug_config.step_angle);
     }
 
     g_sonar_app.debug_config.capture_type = CAPTURE_TYPE_RAW_WAVE;
@@ -559,6 +1069,9 @@ static void App_HandleConfigDebug(uint16_t sequence, const uint8_t *payload, uin
     g_sonar_app.mode = SONAR_APP_MODE_DEBUG_SINGLE;
   }
   g_sonar_app.status = SONAR_STATUS_READY;
+  detail[1] = ((original_start != g_sonar_app.debug_config.start_angle) ||
+               (original_end != g_sonar_app.debug_config.end_angle) ||
+               (original_step != g_sonar_app.debug_config.step_angle)) ? 1U : 0U;
   App_SendAck(sequence, SONAR_CMD_CONFIG_DEBUG, detail, sizeof(detail));
 }
 
@@ -596,6 +1109,8 @@ static void App_HandleMoveToAngle(uint16_t sequence, const uint8_t *payload, uin
   uint8_t detail[6];
   uint16_t target_angle = 0U;
   uint8_t move_dir = 0U;
+  uint16_t arrived_angle = 0U;
+  SonarResultCode move_result = SONAR_RESULT_OK;
 
   if (payload_length != 2U)
   {
@@ -609,26 +1124,37 @@ static void App_HandleMoveToAngle(uint16_t sequence, const uint8_t *payload, uin
     return;
   }
 
-  target_angle = App_ReadU16(payload);
+  target_angle = App_NormalizeSideScanAngleCdeg(App_ReadU16(payload));
   move_dir = App_ComputeMoveDirection(g_sonar_app.current_angle, target_angle);
 
   g_sonar_app.status = SONAR_STATUS_MOVING;
   g_sonar_app.target_angle = target_angle;
   App_SendStatusEvent(EVENT_MOVE_START, target_angle);
 
-  SonarApp_OnMoveComplete(&g_sonar_app, target_angle);
-  App_SendStatusEvent(EVENT_MOVE_ARRIVED, target_angle);
+  move_result = App_MoveMotorToAngleBlocking(target_angle, &move_dir, &arrived_angle);
+  if (move_result != SONAR_RESULT_OK)
+  {
+    g_sonar_app.status = SONAR_STATUS_READY;
+    App_SendNack(sequence, SONAR_CMD_MOVE_TO_ANGLE, move_result);
+    return;
+  }
+
+  SonarApp_OnMoveComplete(&g_sonar_app, arrived_angle);
+  App_SendStatusEvent(EVENT_MOVE_ARRIVED, g_sonar_app.current_angle);
 
   App_WriteU16(&detail[0], g_sonar_app.current_angle);
   App_WriteU16(&detail[2], target_angle);
   detail[4] = move_dir;
-  detail[5] = 1U;
+  detail[5] = (g_sonar_app.current_angle == target_angle) ? 1U : 0U;
   App_SendAck(sequence, SONAR_CMD_MOVE_TO_ANGLE, detail, sizeof(detail));
 }
 
 static void App_HandleStartSingleMeasure(uint16_t sequence)
 {
   uint8_t detail[1] = {1U};
+  uint8_t move_dir = 0U;
+  uint16_t arrived_angle = 0U;
+  SonarResultCode move_result = SONAR_RESULT_OK;
 
   if (g_sonar_app.status != SONAR_STATUS_READY)
   {
@@ -636,10 +1162,25 @@ static void App_HandleStartSingleMeasure(uint16_t sequence)
     return;
   }
 
+  if (App_IsSideScanProbeMode() != 0U)
+  {
+    g_sonar_app.status = SONAR_STATUS_MOVING;
+    g_sonar_app.target_angle = g_sonar_app.debug_config.start_angle;
+    App_SendStatusEvent(EVENT_MOVE_START, g_sonar_app.target_angle);
+    move_result = App_MoveMotorToAngleBlocking(g_sonar_app.target_angle, &move_dir, &arrived_angle);
+    if (move_result != SONAR_RESULT_OK)
+    {
+      g_sonar_app.status = SONAR_STATUS_READY;
+      App_SendNack(sequence, SONAR_CMD_START_SINGLE_MEASURE, move_result);
+      return;
+    }
+    SonarApp_OnMoveComplete(&g_sonar_app, arrived_angle);
+    App_SendStatusEvent(EVENT_MOVE_ARRIVED, g_sonar_app.current_angle);
+  }
+
   g_sonar_app.status = SONAR_STATUS_MEASURING;
   g_sonar_app.mode = SONAR_APP_MODE_DEBUG_SINGLE;
   g_active_measure_sequence = sequence;
-  g_sonar_app.current_angle = g_sonar_app.debug_config.start_angle;
   App_SendAck(sequence, SONAR_CMD_START_SINGLE_MEASURE, detail, sizeof(detail));
   App_SendStatusEvent(EVENT_MEASURE_START, 0U);
 
@@ -649,11 +1190,19 @@ static void App_HandleStartSingleMeasure(uint16_t sequence)
 static void App_HandleStartDebugSweep(uint16_t sequence)
 {
   uint8_t detail[1] = {1U};
+  uint8_t finish_reason = 0U;
   uint16_t point_index = 0U;
   uint16_t angle = g_sonar_app.debug_config.start_angle;
   uint16_t step = g_sonar_app.debug_config.step_angle;
   uint8_t has_wave = ((g_sonar_app.debug_config.flags & 0x08U) != 0U) ? 1U : 0U;
   uint8_t single_only = 0U;
+  uint8_t move_dir = 0U;
+  uint16_t arrived_angle = 0U;
+  SonarResultCode move_result = SONAR_RESULT_OK;
+  SonarResultCode measure_result = SONAR_RESULT_OK;
+  uint32_t distance_mm = 0U;
+  uint16_t quality = 0U;
+  uint8_t uploaded_buffer_index = DEPTH_BUFFER_INVALID;
 
   if (g_sonar_app.status != SONAR_STATUS_READY)
   {
@@ -669,7 +1218,7 @@ static void App_HandleStartDebugSweep(uint16_t sequence)
 
   if (step == 0U)
   {
-    step = 100U;
+    step = App_GetDefaultSideScanStepCdeg();
   }
 
   single_only = (g_sonar_app.debug_config.end_angle == g_sonar_app.debug_config.start_angle) ? 1U : 0U;
@@ -685,13 +1234,31 @@ static void App_HandleStartDebugSweep(uint16_t sequence)
   App_SendAck(sequence, SONAR_CMD_START_DEBUG_SWEEP, detail, sizeof(detail));
   App_SendStatusEvent(EVENT_MOVE_START, g_sonar_app.debug_config.start_angle);
 
+  g_sonar_app.status = SONAR_STATUS_MOVING;
+  move_result = App_MoveMotorToAngleBlocking(angle, &move_dir, &arrived_angle);
+  if (move_result != SONAR_RESULT_OK)
+  {
+    g_sonar_app.status = SONAR_STATUS_READY;
+    App_SendNack(sequence, SONAR_CMD_START_DEBUG_SWEEP, move_result);
+    return;
+  }
+  g_sonar_app.current_angle = arrived_angle;
+  App_SendStatusEvent(EVENT_MOVE_ARRIVED, g_sonar_app.current_angle);
+  g_sonar_app.status = SONAR_STATUS_DEBUG_SCANNING;
+
   while (1)
   {
-    uint32_t distance = App_GenerateDistanceForAngle(angle, 780UL, 720UL, 0.0f);
-    uint16_t quality = (uint16_t)(70U + (point_index % 25U));
-
-    g_sonar_app.current_angle = angle;
-    App_SendDebugSweepPoint(sequence, point_index, angle, distance, quality, has_wave);
+    g_sonar_app.status = SONAR_STATUS_MEASURING;
+    App_SendStatusEvent(EVENT_MEASURE_START, g_sonar_app.current_angle);
+    measure_result = App_CaptureSweepMeasurement(sequence, &distance_mm, &quality, has_wave, &uploaded_buffer_index);
+    if (measure_result != SONAR_RESULT_OK)
+    {
+      finish_reason = 0x03U;
+      g_sonar_app.status = SONAR_STATUS_READY;
+      break;
+    }
+    App_SendDebugSweepPoint(sequence, point_index, g_sonar_app.current_angle, distance_mm, quality, has_wave);
+    App_SendStatusEvent(EVENT_MEASURE_DONE, g_sonar_app.current_angle);
     point_index++;
 
     if ((single_only != 0U) || (angle == g_sonar_app.debug_config.end_angle))
@@ -707,12 +1274,42 @@ static void App_HandleStartDebugSweep(uint16_t sequence)
     {
       angle = (uint16_t)(angle + step);
     }
+
+    g_sonar_app.status = SONAR_STATUS_MOVING;
+    move_result = App_MoveMotorByAngleDeltaBlocking((int32_t)angle - (int32_t)g_sonar_app.current_angle, &arrived_angle);
+    if (move_result != SONAR_RESULT_OK)
+    {
+      finish_reason = 0x02U;
+      g_sonar_app.status = SONAR_STATUS_READY;
+      break;
+    }
+
+    if (has_wave != 0U)
+    {
+      App_FlushDepthUploads(5000U);
+      uploaded_buffer_index = DEPTH_BUFFER_INVALID;
+      if ((g_depth_upload.active != 0U) || (App_FindReadyDepthBuffer() < DEPTH_BUFFER_COUNT))
+      {
+        finish_reason = 0x04U;
+        g_sonar_app.status = SONAR_STATUS_READY;
+        break;
+      }
+    }
+
+    g_sonar_app.status = SONAR_STATUS_DEBUG_SCANNING;
+    g_sonar_app.current_angle = arrived_angle;
+    App_SendStatusEvent(EVENT_MOVE_ARRIVED, g_sonar_app.current_angle);
+  }
+
+  if (has_wave != 0U)
+  {
+    App_FlushDepthUploads(5000U);
   }
 
   {
     uint8_t finish_payload[3];
     App_WriteU16(&finish_payload[0], point_index);
-    finish_payload[2] = 0U;
+    finish_payload[2] = finish_reason;
     App_SendFrame(SONAR_CMD_DEBUG_SWEEP_FINISH, sequence, finish_payload, sizeof(finish_payload));
   }
 
@@ -732,7 +1329,6 @@ static void App_HandleStop(uint16_t sequence)
 
   if (g_sonar_app.status == SONAR_STATUS_ZEROING)
   {
-    g_pending_zero_valid = 0U;
     SonarApp_OnZeroingComplete(&g_sonar_app);
     App_SendAck(sequence, SONAR_CMD_STOP, detail, sizeof(detail));
     App_SendStatusEvent(EVENT_MOVE_ARRIVED, 0U);
@@ -754,43 +1350,37 @@ static void App_HandleStop(uint16_t sequence)
 
 static void App_StartZeroing(uint16_t sequence, uint8_t ref_command)
 {
-  g_pending_zero_sequence = sequence;
-  g_pending_zero_command = ref_command;
-  g_pending_zero_valid = 1U;
-  g_state_entered_ms = HAL_GetTick();
+  uint8_t detail[5];
+  SonarResultCode result = SONAR_RESULT_OK;
+
   g_sonar_app.status = SONAR_STATUS_ZEROING;
   g_sonar_app.current_angle = 0U;
   g_sonar_app.target_angle = 0U;
   App_SendStatusEvent(EVENT_ZEROING_START, 0U);
-}
-
-static void App_FinishZeroing(void)
-{
-  uint8_t detail[5];
+  result = App_ZeroMotorBlocking();
+  if (result != SONAR_RESULT_OK)
+  {
+    g_sonar_app.status = SONAR_STATUS_READY;
+    App_SendNack(sequence, ref_command, result);
+    return;
+  }
 
   SonarApp_OnZeroingComplete(&g_sonar_app);
   App_SendStatusEvent(EVENT_ZEROING_DONE, 0U);
 
-  if (g_pending_zero_valid == 0U)
-  {
-    return;
-  }
-
-  if (g_pending_zero_command == SONAR_CMD_CONFIG_SCAN)
+  if (ref_command == SONAR_CMD_CONFIG_SCAN)
   {
     detail[0] = 1U;
     App_WriteU16(&detail[1], g_sonar_app.current_angle);
     App_WriteU16(&detail[3], App_GetScanPointCount(g_sonar_app.scan_config.scan_step));
-    App_SendAck(g_pending_zero_sequence, SONAR_CMD_CONFIG_SCAN, detail, sizeof(detail));
+    App_SendAck(sequence, SONAR_CMD_CONFIG_SCAN, detail, sizeof(detail));
   }
-  else if (g_pending_zero_command == SONAR_CMD_ZEROING)
+  else if (ref_command == SONAR_CMD_ZEROING)
   {
     detail[0] = 1U;
     App_WriteU16(&detail[1], g_sonar_app.current_angle);
-    App_SendAck(g_pending_zero_sequence, SONAR_CMD_ZEROING, detail, 3U);
+    App_SendAck(sequence, SONAR_CMD_ZEROING, detail, 3U);
   }
-
-  g_pending_zero_valid = 0U;
 }
 
 static void App_FinishScan(uint8_t end_reason)
@@ -858,14 +1448,47 @@ static void App_SendAck(uint16_t sequence, uint8_t ref_command, const uint8_t *d
 
 static void App_SendNack(uint16_t sequence, uint8_t ref_command, SonarResultCode result)
 {
-  uint8_t payload[4];
+  uint8_t payload[32];
+  uint16_t payload_length = 4U;
 
   payload[0] = (uint8_t)result;
   payload[1] = (uint8_t)g_sonar_app.status;
   payload[2] = ref_command;
   payload[3] = (uint8_t)result;
 
-  App_SendFrame(SONAR_CMD_NACK, sequence, payload, sizeof(payload));
+  payload_length = App_AppendMotorTrace(payload, payload_length, (uint16_t)sizeof(payload));
+  App_SendFrame(SONAR_CMD_NACK, sequence, payload, payload_length);
+}
+
+static uint16_t App_AppendMotorTrace(uint8_t *payload, uint16_t payload_length, uint16_t payload_capacity)
+{
+  uint16_t copy_length = 0U;
+
+  if ((payload == NULL) || (payload_capacity <= payload_length) || ((payload_capacity - payload_length) < 4U))
+  {
+    return payload_length;
+  }
+
+  payload[payload_length++] = (uint8_t)g_motor_driver_trace.result;
+  payload[payload_length++] = (uint8_t)g_motor_driver_trace.request_length;
+  payload[payload_length++] = (uint8_t)g_motor_driver_trace.response_length;
+  copy_length = (uint16_t)(payload_capacity - payload_length);
+  if (copy_length > 6U)
+  {
+    copy_length = 6U;
+  }
+  memcpy(&payload[payload_length], (const void *)g_motor_driver_trace.request, copy_length);
+  payload_length = (uint16_t)(payload_length + copy_length);
+
+  copy_length = (uint16_t)(payload_capacity - payload_length);
+  if (copy_length > 6U)
+  {
+    copy_length = 6U;
+  }
+  memcpy(&payload[payload_length], (const void *)g_motor_driver_trace.response, copy_length);
+  payload_length = (uint16_t)(payload_length + copy_length);
+
+  return payload_length;
 }
 
 static void App_SendStatusEvent(uint8_t event, uint16_t detail)
@@ -932,6 +1555,8 @@ static void App_SendDebugSweepPoint(uint16_t sequence, uint16_t point_index, uin
 static void App_ProcessDepthUpload(void)
 {
   uint8_t buffer_index = 0U;
+  uint8_t preserve_debug_status = (g_sonar_app.mode == SONAR_APP_MODE_DEBUG_SWEEP) ? 1U : 0U;
+  SonarDeviceStatus previous_status = g_sonar_app.status;
 
   if (g_depth_upload.active == 0U)
   {
@@ -950,9 +1575,12 @@ static void App_ProcessDepthUpload(void)
     g_depth_upload.sample_count = g_depth_buffer_slots[buffer_index].sample_count;
     g_depth_upload.total_bytes = (uint16_t)(g_depth_upload.sample_count * 2U);
     g_depth_upload.total_frames = (uint16_t)((g_depth_upload.total_bytes + WAVE_CHUNK_DATA_SIZE - 1U) / WAVE_CHUNK_DATA_SIZE);
-    g_sonar_app.status = SONAR_STATUS_UPLOADING;
+    if (preserve_debug_status == 0U)
+    {
+      g_sonar_app.status = SONAR_STATUS_UPLOADING;
+    }
     g_debug_upload_stage = 5U;
-    App_SendStatusEvent(EVENT_UPLOAD_START, 0U);
+    App_SendStatusEvent(EVENT_UPLOAD_START, g_depth_upload.angle);
     if (g_depth_upload.total_frames == 0U)
     {
       g_depth_upload.total_frames = 1U;
@@ -999,13 +1627,23 @@ static void App_ProcessDepthUpload(void)
     App_SendFrame(SONAR_CMD_WAVE_FINISH, g_depth_upload.sequence, finish_payload, sizeof(finish_payload));
   }
 
+  {
+    uint16_t uploaded_angle = g_depth_upload.angle;
+
   App_ReleaseDepthBuffer(g_depth_upload.buffer_index);
   memset(&g_depth_upload, 0, sizeof(g_depth_upload));
   g_debug_upload_stage = 8U;
-  SonarApp_OnMeasureComplete(&g_sonar_app);
-  App_SendStatusEvent(EVENT_MEASURE_DONE, 0U);
-  App_SendStatusEvent(EVENT_UPLOAD_DONE, 0U);
-  g_sonar_app.status = SONAR_STATUS_READY;
+  if (preserve_debug_status == 0U)
+  {
+    SonarApp_OnMeasureComplete(&g_sonar_app);
+    App_SendStatusEvent(EVENT_MEASURE_DONE, 0U);
+  }
+  else
+  {
+    g_sonar_app.status = previous_status;
+  }
+  App_SendStatusEvent(EVENT_UPLOAD_DONE, uploaded_angle);
+  }
   g_debug_upload_stage = 9U;
 }
 
@@ -1029,6 +1667,370 @@ static uint32_t App_GenerateDistanceForAngle(uint16_t angle, uint32_t base, uint
   }
 
   return (uint32_t)distance;
+}
+
+static uint32_t App_CalculateDistanceMmFromSamples(const uint16_t *samples, uint16_t sample_count, uint16_t sound_speed_m_s)
+{
+  uint32_t tail_start = 0U;
+  uint32_t baseline_sum = 0U;
+  uint32_t threshold = 0U;
+  uint16_t baseline = 0U;
+  uint16_t index = 0U;
+  const uint16_t baseline_window = 128U;
+  const uint16_t blind_zone_samples = 550U;
+  const uint16_t threshold_counts = 500U;
+  const float sample_rate_hz = 3000000.0f;
+
+  if ((samples == NULL) || (sample_count < (blind_zone_samples + 2U)))
+  {
+    return 0U;
+  }
+
+  if (sound_speed_m_s == 0U)
+  {
+    sound_speed_m_s = (g_sonar_app.scan_config.sound_speed != 0U) ? g_sonar_app.scan_config.sound_speed : 1500U;
+  }
+
+  tail_start = (sample_count > baseline_window) ? (uint32_t)(sample_count - baseline_window) : 0U;
+  for (index = (uint16_t)tail_start; index < sample_count; ++index)
+  {
+    baseline_sum += samples[index];
+  }
+
+  baseline = (uint16_t)(baseline_sum / (uint32_t)(sample_count - tail_start));
+  threshold = (uint32_t)baseline + threshold_counts;
+
+  for (index = blind_zone_samples; index < sample_count; ++index)
+  {
+    if ((uint32_t)samples[index] >= threshold)
+    {
+      float prev_value = (float)samples[index - 1U];
+      float curr_value = (float)samples[index];
+      float crossing = (float)index;
+
+      if (curr_value > prev_value)
+      {
+        crossing = ((float)(index - 1U)) + (((float)threshold - prev_value) / (curr_value - prev_value));
+      }
+
+      return (uint32_t)((crossing * (float)sound_speed_m_s * 1000.0f) / (sample_rate_hz * 2.0f));
+    }
+  }
+
+  return 0U;
+}
+
+static void App_SendWaveFromBuffer(uint16_t sequence, uint16_t angle, uint8_t buffer_index, uint16_t sample_count)
+{
+  uint16_t total_bytes = 0U;
+  uint16_t total_frames = 0U;
+  uint16_t frame_id = 0U;
+
+  if ((buffer_index >= DEPTH_BUFFER_COUNT) || (sample_count == 0U))
+  {
+    return;
+  }
+
+  total_bytes = (uint16_t)(sample_count * 2U);
+  total_frames = (uint16_t)((total_bytes + WAVE_CHUNK_DATA_SIZE - 1U) / WAVE_CHUNK_DATA_SIZE);
+  if (total_frames == 0U)
+  {
+    total_frames = 1U;
+  }
+
+  for (frame_id = 0U; frame_id < total_frames; ++frame_id)
+  {
+    uint16_t offset = (uint16_t)(frame_id * WAVE_CHUNK_DATA_SIZE);
+    uint16_t chunk_size = (uint16_t)(total_bytes - offset);
+    uint8_t payload[11U + WAVE_CHUNK_DATA_SIZE];
+
+    if (chunk_size > WAVE_CHUNK_DATA_SIZE)
+    {
+      chunk_size = WAVE_CHUNK_DATA_SIZE;
+    }
+
+    App_WriteU16(&payload[0], frame_id);
+    App_WriteU16(&payload[2], total_frames);
+    App_WriteU16(&payload[4], offset);
+    App_WriteU16(&payload[6], chunk_size);
+    App_WriteU16(&payload[8], angle);
+    payload[10] = WAVE_DATA_TYPE_U16_RAW;
+    memcpy(&payload[11], ((const uint8_t *)g_depth_samples[buffer_index]) + offset, chunk_size);
+    App_SendFrame(SONAR_CMD_WAVE_CHUNK, sequence, payload, (uint16_t)(11U + chunk_size));
+  }
+
+  {
+    uint8_t finish_payload[5];
+    App_WriteU16(&finish_payload[0], angle);
+    App_WriteU16(&finish_payload[2], sample_count);
+    finish_payload[4] = 0U;
+    App_SendFrame(SONAR_CMD_WAVE_FINISH, sequence, finish_payload, sizeof(finish_payload));
+  }
+}
+
+static SonarResultCode App_RunBlockingMeasurement(uint16_t sequence, uint16_t angle, uint8_t upload_wave, uint32_t *distance_mm, uint16_t *quality)
+{
+  uint32_t started_ms = HAL_GetTick();
+  uint8_t buffer_index = DEPTH_BUFFER_INVALID;
+
+  if (App_WaitForFreeDepthBuffer(5000U) == 0U)
+  {
+    return SONAR_RESULT_BUSY;
+  }
+
+  g_active_measure_sequence = sequence;
+  App_StartDepthCapture(sequence);
+
+  while ((HAL_GetTick() - started_ms) < 500U)
+  {
+    if ((g_depth_capture_complete != 0U) && (g_depth_capture_active == 0U))
+    {
+      g_depth_capture_complete = 0U;
+      buffer_index = g_depth_completed_buffer_index;
+      g_depth_completed_buffer_index = DEPTH_BUFFER_INVALID;
+
+      if (buffer_index >= DEPTH_BUFFER_COUNT)
+      {
+        return SONAR_RESULT_HARDWARE_ERROR;
+      }
+
+      App_InvalidateDepthBufferCache(buffer_index);
+
+      if (distance_mm != NULL)
+      {
+        *distance_mm = App_CalculateDistanceMmFromSamples(
+            g_depth_samples[buffer_index],
+            g_depth_buffer_slots[buffer_index].sample_count,
+            (g_sonar_app.scan_config.sound_speed != 0U) ? g_sonar_app.scan_config.sound_speed : 1500U);
+      }
+
+      if (quality != NULL)
+      {
+        uint16_t sample_index = 0U;
+        uint16_t baseline = 0U;
+        uint16_t peak = 0U;
+        uint32_t tail_sum = 0U;
+        uint16_t tail_start = (g_depth_buffer_slots[buffer_index].sample_count > 128U) ? (uint16_t)(g_depth_buffer_slots[buffer_index].sample_count - 128U) : 0U;
+
+        for (sample_index = tail_start; sample_index < g_depth_buffer_slots[buffer_index].sample_count; ++sample_index)
+        {
+          tail_sum += g_depth_samples[buffer_index][sample_index];
+        }
+        baseline = (uint16_t)(tail_sum / (uint32_t)(g_depth_buffer_slots[buffer_index].sample_count - tail_start));
+
+        for (sample_index = 0U; sample_index < g_depth_buffer_slots[buffer_index].sample_count; ++sample_index)
+        {
+          if (g_depth_samples[buffer_index][sample_index] > peak)
+          {
+            peak = g_depth_samples[buffer_index][sample_index];
+          }
+        }
+
+        *quality = (uint16_t)((peak > baseline) ? ((peak - baseline) > 1000U ? 1000U : (peak - baseline)) : 0U);
+      }
+
+      if (upload_wave != 0U)
+      {
+        if (g_sonar_app.mode == SONAR_APP_MODE_DEBUG_SWEEP)
+        {
+          g_depth_buffer_slots[buffer_index].state = DEPTH_BUFFER_STATE_READY;
+          return SONAR_RESULT_OK;
+        }
+
+        App_SendStatusEvent(EVENT_UPLOAD_START, angle);
+        App_SendWaveFromBuffer(sequence, angle, buffer_index, g_depth_buffer_slots[buffer_index].sample_count);
+        App_SendStatusEvent(EVENT_UPLOAD_DONE, angle);
+      }
+
+      App_ReleaseDepthBuffer(buffer_index);
+      return SONAR_RESULT_OK;
+    }
+
+    if ((g_depth_capture_timeout != 0U) && (g_depth_capture_active == 0U))
+    {
+      buffer_index = g_depth_timeout_buffer_index;
+      if (buffer_index < DEPTH_BUFFER_COUNT)
+      {
+        App_ReleaseDepthBuffer(buffer_index);
+      }
+      g_depth_timeout_buffer_index = DEPTH_BUFFER_INVALID;
+      g_depth_capture_timeout = 0U;
+      return SONAR_RESULT_TIMEOUT;
+    }
+  }
+
+  App_StopDepthCapture();
+  if (g_depth_capture_buffer_index < DEPTH_BUFFER_COUNT)
+  {
+    App_ReleaseDepthBuffer(g_depth_capture_buffer_index);
+    g_depth_capture_buffer_index = DEPTH_BUFFER_INVALID;
+  }
+  return SONAR_RESULT_TIMEOUT;
+}
+
+static SonarResultCode App_CaptureSweepMeasurement(uint16_t sequence, uint32_t *distance_mm, uint16_t *quality, uint8_t upload_wave, uint8_t *buffer_index)
+{
+  uint32_t started_ms = HAL_GetTick();
+  uint8_t local_buffer_index = DEPTH_BUFFER_INVALID;
+
+  if (buffer_index != NULL)
+  {
+    *buffer_index = DEPTH_BUFFER_INVALID;
+  }
+
+  if (App_WaitForFreeDepthBuffer(8000U) == 0U)
+  {
+    return SONAR_RESULT_BUSY;
+  }
+
+  g_active_measure_sequence = sequence;
+  App_StartDepthCapture(sequence);
+
+  while ((HAL_GetTick() - started_ms) < 1000U)
+  {
+    if ((g_depth_capture_complete != 0U) && (g_depth_capture_active == 0U))
+    {
+      uint16_t sample_index = 0U;
+      uint16_t baseline = 0U;
+      uint16_t peak = 0U;
+      uint32_t tail_sum = 0U;
+      uint16_t tail_start = 0U;
+
+      g_depth_capture_complete = 0U;
+      local_buffer_index = g_depth_completed_buffer_index;
+      g_depth_completed_buffer_index = DEPTH_BUFFER_INVALID;
+
+      if (local_buffer_index >= DEPTH_BUFFER_COUNT)
+      {
+        return SONAR_RESULT_HARDWARE_ERROR;
+      }
+
+      App_InvalidateDepthBufferCache(local_buffer_index);
+
+      if (distance_mm != NULL)
+      {
+        *distance_mm = App_CalculateDistanceMmFromSamples(
+            g_depth_samples[local_buffer_index],
+            g_depth_buffer_slots[local_buffer_index].sample_count,
+            (g_sonar_app.scan_config.sound_speed != 0U) ? g_sonar_app.scan_config.sound_speed : 1500U);
+      }
+
+      if (quality != NULL)
+      {
+        tail_start = (g_depth_buffer_slots[local_buffer_index].sample_count > 128U) ? (uint16_t)(g_depth_buffer_slots[local_buffer_index].sample_count - 128U) : 0U;
+        for (sample_index = tail_start; sample_index < g_depth_buffer_slots[local_buffer_index].sample_count; ++sample_index)
+        {
+          tail_sum += g_depth_samples[local_buffer_index][sample_index];
+        }
+        baseline = (uint16_t)(tail_sum / (uint32_t)(g_depth_buffer_slots[local_buffer_index].sample_count - tail_start));
+        for (sample_index = 0U; sample_index < g_depth_buffer_slots[local_buffer_index].sample_count; ++sample_index)
+        {
+          if (g_depth_samples[local_buffer_index][sample_index] > peak)
+          {
+            peak = g_depth_samples[local_buffer_index][sample_index];
+          }
+        }
+        *quality = (uint16_t)((peak > baseline) ? ((peak - baseline) > 1000U ? 1000U : (peak - baseline)) : 0U);
+      }
+
+      if (upload_wave != 0U)
+      {
+        g_depth_buffer_slots[local_buffer_index].state = DEPTH_BUFFER_STATE_READY;
+        if (buffer_index != NULL)
+        {
+          *buffer_index = local_buffer_index;
+        }
+      }
+      else
+      {
+        App_ReleaseDepthBuffer(local_buffer_index);
+      }
+
+      return SONAR_RESULT_OK;
+    }
+
+    if ((g_depth_capture_timeout != 0U) && (g_depth_capture_active == 0U))
+    {
+      local_buffer_index = g_depth_timeout_buffer_index;
+      if (local_buffer_index < DEPTH_BUFFER_COUNT)
+      {
+        App_ReleaseDepthBuffer(local_buffer_index);
+      }
+      g_depth_timeout_buffer_index = DEPTH_BUFFER_INVALID;
+      g_depth_capture_timeout = 0U;
+      return SONAR_RESULT_TIMEOUT;
+    }
+
+    HAL_Delay(1U);
+  }
+
+  App_StopDepthCapture();
+  if (g_depth_capture_buffer_index < DEPTH_BUFFER_COUNT)
+  {
+    App_ReleaseDepthBuffer(g_depth_capture_buffer_index);
+    g_depth_capture_buffer_index = DEPTH_BUFFER_INVALID;
+  }
+  return SONAR_RESULT_TIMEOUT;
+}
+
+static void App_ServiceBackgroundTasks(uint32_t duration_ms)
+{
+  uint32_t started_ms = HAL_GetTick();
+
+  do
+  {
+    App_ProcessDepthUpload();
+    HAL_Delay(2U);
+  } while ((HAL_GetTick() - started_ms) < duration_ms);
+}
+
+static void App_FlushDepthUploads(uint32_t timeout_ms)
+{
+  uint32_t started_ms = HAL_GetTick();
+
+  while ((HAL_GetTick() - started_ms) < timeout_ms)
+  {
+    if ((g_depth_upload.active == 0U) && (App_FindReadyDepthBuffer() >= DEPTH_BUFFER_COUNT))
+    {
+      return;
+    }
+
+    App_ProcessDepthUpload();
+    HAL_Delay(2U);
+  }
+}
+
+static uint8_t App_HasFreeDepthBuffer(void)
+{
+  uint8_t index = 0U;
+
+  for (index = 0U; index < DEPTH_BUFFER_COUNT; ++index)
+  {
+    if (g_depth_buffer_slots[index].state == DEPTH_BUFFER_STATE_FREE)
+    {
+      return 1U;
+    }
+  }
+
+  return 0U;
+}
+
+static uint8_t App_WaitForFreeDepthBuffer(uint32_t timeout_ms)
+{
+  uint32_t started_ms = HAL_GetTick();
+
+  while ((HAL_GetTick() - started_ms) < timeout_ms)
+  {
+    if (App_HasFreeDepthBuffer() != 0U)
+    {
+      return 1U;
+    }
+
+    App_ProcessDepthUpload();
+    HAL_Delay(2U);
+  }
+
+  return App_HasFreeDepthBuffer();
 }
 
 static uint8_t App_ComputeMoveDirection(uint16_t current_angle, uint16_t target_angle)
@@ -1456,7 +2458,12 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   SonarApp_Init(&g_sonar_app);
+  App_InitMotorController();
   g_last_device_info_broadcast_ms = HAL_GetTick();
+  if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED) != HAL_OK)
+  {
+    Error_Handler();
+  }
   if (HAL_ADCEx_Calibration_Start(&hadc2, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED) != HAL_OK)
   {
     Error_Handler();

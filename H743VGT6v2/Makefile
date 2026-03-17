@@ -42,6 +42,7 @@ Core/Src/adc.c \
 Core/Src/dma.c \
 Core/Src/tim.c \
 Core/Src/usart.c \
+Core/Src/motor_driver.c \
 Core/Src/sonar_protocol.c \
 Core/Src/sonar_app.c \
 Core/Src/stm32h7xx_it.c \

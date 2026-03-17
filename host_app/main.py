@@ -67,6 +67,12 @@ SIMULATOR_PORT = "SIMULATOR"
 ADC_REFERENCE_VOLTAGE = 3.3
 ADC_FULL_SCALE = 65535.0
 WAVE_SAMPLE_RATE_HZ = 3_000_000.0
+MOTOR_ANGLE_RESOLUTION_DEG = 1.8
+MOTOR_MAX_ANGLE_DEG = 360.0 - MOTOR_ANGLE_RESOLUTION_DEG
+SIDE_SCAN_MIN_STEP_DEG = 1.8
+SIDE_SCAN_DEFAULT_STEP_DEG = 5.4
+SIDE_SCAN_MAX_STEP_DEG = 19.8
+ANGLE_DISPLAY_DECIMALS = 3
 
 EVENT_LABELS = {
     0x01: "Zeroing start",
@@ -516,13 +522,14 @@ class SessionRecorder:
             [f"{result.angle / 100.0:.2f}", result.distance_mm, result.quality, int(result.valid)],
         )
 
-    def save_waveform(self, *, angle: int, data_type: WaveDataType, raw_bytes: bytes, sample_count: int) -> None:
+    def save_waveform(self, *, angle: int, data_type: WaveDataType, raw_bytes: bytes, sample_count: int, sound_speed_m_s: int) -> None:
         if self.session_dir is None:
             return
 
         stamp = int(time.time() * 1000)
         bin_path = self.session_dir / f"wave_{angle:05d}_{stamp}.bin"
         meta_path = self.session_dir / f"wave_{angle:05d}_{stamp}.json"
+        csv_path = self.session_dir / f"wave_{angle:05d}_{stamp}.csv"
         bin_path.write_bytes(raw_bytes)
         meta_path.write_text(
             json.dumps(
@@ -530,12 +537,41 @@ class SessionRecorder:
                     "angle_deg": angle / 100.0,
                     "data_type": data_type.name,
                     "sample_count": sample_count,
+                    "sound_speed_m_s": sound_speed_m_s,
                     "bin_file": bin_path.name,
+                    "csv_file": csv_path.name,
                 },
                 ensure_ascii=False,
                 indent=2,
             ),
             encoding="utf-8",
+        )
+        samples: list[int]
+        if data_type in (WaveDataType.U16_RAW, WaveDataType.U16_ENVELOPE):
+            count = min(sample_count, len(raw_bytes) // 2)
+            samples = list(struct.unpack(f"<{count}H", raw_bytes[: count * 2]))
+            with csv_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["sample_index", "time_us", "distance_mm", "raw_code", "voltage_v"])
+                for index, value in enumerate(samples):
+                    time_us = (index / WAVE_SAMPLE_RATE_HZ) * 1_000_000.0
+                    distance_mm = time_us * float(sound_speed_m_s) / 2000.0
+                    voltage_v = float(value) * ADC_REFERENCE_VOLTAGE / ADC_FULL_SCALE
+                    writer.writerow([index, f"{time_us:.6f}", f"{distance_mm:.6f}", value, f"{voltage_v:.6f}"])
+        else:
+            samples = list(raw_bytes[:sample_count])
+            with csv_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["sample_index", "time_us", "distance_mm", "value"])
+                for index, value in enumerate(samples):
+                    time_us = (index / WAVE_SAMPLE_RATE_HZ) * 1_000_000.0
+                    distance_mm = time_us * float(sound_speed_m_s) / 2000.0
+                    writer.writerow([index, f"{time_us:.6f}", f"{distance_mm:.6f}", value])
+
+        self._append_csv(
+            "wave_index.csv",
+            ["angle_deg", "data_type", "sample_count", "sound_speed_m_s", "bin_file", "json_file", "csv_file"],
+            [f"{angle / 100.0:.2f}", data_type.name, sample_count, sound_speed_m_s, bin_path.name, meta_path.name, csv_path.name],
         )
 
     def _append_csv(self, filename: str, header: list[str], row: list[Any]) -> None:
@@ -845,9 +881,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.scan_step_title = QtWidgets.QLabel()
         self.scan_step_spin = QtWidgets.QDoubleSpinBox()
-        self.scan_step_spin.setDecimals(2)
-        self.scan_step_spin.setRange(0.10, 180.0)
-        self.scan_step_spin.setValue(1.0)
+        self.scan_step_spin.setDecimals(ANGLE_DISPLAY_DECIMALS)
+        self.scan_step_spin.setRange(SIDE_SCAN_MIN_STEP_DEG, SIDE_SCAN_MAX_STEP_DEG)
+        self.scan_step_spin.setValue(self._normalize_motor_step_degrees(SIDE_SCAN_DEFAULT_STEP_DEG))
         self.scan_step_spin.setSuffix(" deg")
 
         self.sound_speed_title = QtWidgets.QLabel()
@@ -1028,6 +1064,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_scan_button.clicked.connect(self._start_scan)
         self.save_scan_button.clicked.connect(self._save_scan_csv)
         self.enable_3d_check.toggled.connect(self._toggle_point_cloud_window)
+        self.scan_step_spin.valueChanged.connect(self._normalize_scan_step_input)
         return tab
 
     def _build_debug_tab(self) -> QtWidgets.QWidget:
@@ -1045,23 +1082,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.debug_start_title = QtWidgets.QLabel()
         self.debug_start_spin = QtWidgets.QDoubleSpinBox()
-        self.debug_start_spin.setDecimals(2)
-        self.debug_start_spin.setRange(0.0, 359.99)
+        self.debug_start_spin.setDecimals(ANGLE_DISPLAY_DECIMALS)
+        self.debug_start_spin.setRange(0.0, MOTOR_MAX_ANGLE_DEG)
         self.debug_start_spin.setValue(0.0)
         self.debug_start_spin.setSuffix(" deg")
 
         self.debug_end_title = QtWidgets.QLabel()
         self.debug_end_spin = QtWidgets.QDoubleSpinBox()
-        self.debug_end_spin.setDecimals(2)
-        self.debug_end_spin.setRange(0.0, 359.99)
+        self.debug_end_spin.setDecimals(ANGLE_DISPLAY_DECIMALS)
+        self.debug_end_spin.setRange(0.0, MOTOR_MAX_ANGLE_DEG)
         self.debug_end_spin.setValue(90.0)
         self.debug_end_spin.setSuffix(" deg")
 
         self.debug_step_title = QtWidgets.QLabel()
         self.debug_step_spin = QtWidgets.QDoubleSpinBox()
-        self.debug_step_spin.setDecimals(2)
-        self.debug_step_spin.setRange(0.0, 180.0)
-        self.debug_step_spin.setValue(5.0)
+        self.debug_step_spin.setDecimals(ANGLE_DISPLAY_DECIMALS)
+        self.debug_step_spin.setRange(0.0, SIDE_SCAN_MAX_STEP_DEG)
+        self.debug_step_spin.setValue(self._normalize_motor_step_degrees(SIDE_SCAN_DEFAULT_STEP_DEG))
         self.debug_step_spin.setSuffix(" deg")
 
         self.debug_sound_speed_title = QtWidgets.QLabel()
@@ -1085,14 +1122,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pulse_count_spin.setRange(1, 255)
         self.pulse_count_spin.setValue(6)
 
-        self.upload_distance_check = QtWidgets.QCheckBox("Upload distance")
-        self.upload_distance_check.setChecked(True)
         self.upload_wave_check = QtWidgets.QCheckBox("Upload wave")
         self.upload_wave_check.setChecked(True)
 
-        self.apply_single_config_button = QtWidgets.QPushButton()
         self.single_measure_button = QtWidgets.QPushButton()
-        self.apply_sweep_config_button = QtWidgets.QPushButton()
         self.start_debug_sweep_button = QtWidgets.QPushButton()
         self.save_wave_button = QtWidgets.QPushButton()
 
@@ -1104,11 +1137,8 @@ class MainWindow(QtWidgets.QMainWindow):
         control_form.addRow(self.sample_count_title, self.sample_count_spin)
         control_form.addRow(self.capture_type_title, self.capture_type_combo)
         control_form.addRow(self.pulse_count_title, self.pulse_count_spin)
-        control_form.addRow(self.upload_distance_check)
         control_form.addRow(self.upload_wave_check)
-        control_form.addRow(self.apply_single_config_button)
         control_form.addRow(self.single_measure_button)
-        control_form.addRow(self.apply_sweep_config_button)
         control_form.addRow(self.start_debug_sweep_button)
         control_form.addRow(self.save_wave_button)
 
@@ -1168,15 +1198,14 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setHorizontalSpacing(8)
         layout.setVerticalSpacing(8)
 
-        self.apply_single_config_button.clicked.connect(self._configure_debug_single)
         self.single_measure_button.clicked.connect(self._start_single_measure)
-        self.apply_sweep_config_button.clicked.connect(self._configure_debug_sweep)
         self.start_debug_sweep_button.clicked.connect(self._start_debug_sweep)
         self.save_wave_button.clicked.connect(self._save_wave_csv)
         self.probe_type_tabs.currentChanged.connect(self._handle_debug_probe_change)
         self.debug_sound_speed_spin.valueChanged.connect(self._refresh_wave_plot_axes)
         self.debug_start_spin.valueChanged.connect(self._normalize_debug_angle_inputs)
         self.debug_end_spin.valueChanged.connect(self._normalize_debug_angle_inputs)
+        self.debug_step_spin.valueChanged.connect(self._normalize_debug_angle_inputs)
         self._update_debug_probe_mode_ui()
         return tab
 
@@ -1246,13 +1275,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sample_count_title.setText(self._tr("sample_count"))
         self.capture_type_title.setText(self._tr("capture_type"))
         self.pulse_count_title.setText(self._tr("pulse_count"))
-        self.upload_distance_check.setText(self._tr("upload_distance"))
         self.upload_wave_check.setText(self._tr("upload_wave"))
-        self.apply_single_config_button.setText(self._tr("config_single"))
         self.single_measure_button.setText(
             self._tr("test_button") if self.debug_probe_type == ProbeType.DEPTH_PROBE else self._tr("single_measure")
         )
-        self.apply_sweep_config_button.setText(self._tr("config_sweep"))
         self.start_debug_sweep_button.setText(self._tr("start_sweep"))
         self.save_wave_button.setText(self._tr("save_wave_csv"))
         self.debug_session_title.setText(self._tr("session"))
@@ -1302,26 +1328,31 @@ class MainWindow(QtWidgets.QMainWindow):
     def _normalize_debug_angle_inputs(self) -> None:
         if self.debug_probe_type == ProbeType.DEPTH_PROBE:
             return
-        if self.debug_end_spin.value() < self.debug_start_spin.value():
-            self.debug_end_spin.blockSignals(True)
-            self.debug_end_spin.setValue(self.debug_start_spin.value())
-            self.debug_end_spin.blockSignals(False)
+        start_value = self._normalize_motor_angle_degrees(self.debug_start_spin.value())
+        end_value = self._normalize_motor_angle_degrees(self.debug_end_spin.value())
+        step_value = self._normalize_motor_step_degrees(self.debug_step_spin.value())
+
+        if end_value < start_value:
+            end_value = start_value
+
+        self._set_spinbox_value_if_needed(self.debug_start_spin, start_value)
+        self._set_spinbox_value_if_needed(self.debug_end_spin, end_value)
+        self._set_spinbox_value_if_needed(self.debug_step_spin, step_value)
 
     def _update_debug_probe_mode_ui(self) -> None:
         depth_mode = self.debug_probe_type == ProbeType.DEPTH_PROBE
         angle_widgets = (self.debug_start_spin, self.debug_end_spin, self.debug_step_spin)
         for widget in angle_widgets:
             widget.setEnabled(not depth_mode)
-        self.apply_sweep_config_button.setEnabled(not depth_mode and self.worker is not None and self.worker.isRunning())
-        self.start_debug_sweep_button.setEnabled(not depth_mode and self.worker is not None and self.worker.isRunning())
+        connected = self.worker is not None and self.worker.isRunning()
+        self.start_debug_sweep_button.setEnabled(not depth_mode and connected)
         if depth_mode:
             self.debug_start_spin.setValue(0.0)
             self.debug_end_spin.setValue(0.0)
             self.debug_step_spin.setValue(0.0)
-            self.upload_distance_check.setChecked(False)
-            self.upload_distance_check.setEnabled(False)
         else:
-            self.upload_distance_check.setEnabled(True)
+            if self.debug_step_spin.value() <= 0.0:
+                self.debug_step_spin.setValue(self._normalize_motor_step_degrees(SIDE_SCAN_DEFAULT_STEP_DEG))
             self._normalize_debug_angle_inputs()
         self.sample_count_spin.setValue(7500)
         self.sample_count_spin.setEnabled(False)
@@ -1396,6 +1427,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._send_packet(encode_stop(self._next_sequence()), "STOP")
 
     def _configure_scan(self) -> None:
+        self._normalize_scan_step_input()
         config = ScanConfig(
             scan_step=int(round(self.scan_step_spin.value() * 100.0)),
             sound_speed=self.sound_speed_spin.value(),
@@ -1450,10 +1482,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _configure_debug_single(self) -> None:
         depth_mode = self.debug_probe_type == ProbeType.DEPTH_PROBE
+        if not depth_mode:
+            self._normalize_debug_angle_inputs()
         angle = 0 if depth_mode else int(round(self.debug_start_spin.value() * 100.0))
-        flags = 0x01
-        if (not depth_mode) and self.upload_distance_check.isChecked():
-            flags |= 0x04
+        flags = 0x05
         if self.upload_wave_check.isChecked():
             flags |= 0x08
 
@@ -1482,13 +1514,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log("Sweep config rejected: end angle must be >= start angle.")
             return
         if (end_angle > start_angle) and (step_angle == 0):
-            step_angle = 100
+            step_angle = int(round(SIDE_SCAN_MIN_STEP_DEG * 100.0))
             self.debug_step_spin.blockSignals(True)
-            self.debug_step_spin.setValue(1.0)
+            self.debug_step_spin.setValue(SIDE_SCAN_MIN_STEP_DEG)
             self.debug_step_spin.blockSignals(False)
-        flags = 0x02
-        if self.upload_distance_check.isChecked():
-            flags |= 0x04
+        flags = 0x06
         if self.upload_wave_check.isChecked():
             flags |= 0x08
 
@@ -1508,6 +1538,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.debug_probe_type == ProbeType.DEPTH_PROBE:
             self._append_log("Depth probe mode keeps the motor fixed.")
             return
+        self._normalize_debug_angle_inputs()
         angle = int(round(self.debug_start_spin.value() * 100.0))
         self.debug_target_label.setText(self._tr("target", value=self._format_angle(angle)))
         self._send_packet(encode_move_to_angle(self._next_sequence(), angle), "MOVE_TO_ANGLE")
@@ -1589,7 +1620,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return f"scan_{stamp}_p{point_count}_a{step_text}_{mode_tag}.csv"
 
     def _compact_angle_token(self, value: float) -> str:
-        text = f"{value:.2f}".rstrip("0").rstrip(".")
+        text = f"{value:.3f}".rstrip("0").rstrip(".")
         return text.replace(".", "p")
 
     def _save_wave_csv(self) -> None:
@@ -1894,6 +1925,7 @@ class MainWindow(QtWidgets.QMainWindow):
             data_type=data_type,
             raw_bytes=raw_bytes,
             sample_count=finish["total_samples"],
+            sound_speed_m_s=self.debug_sound_speed_spin.value(),
         )
 
     def _handle_debug_sweep_point(self, frame: Frame) -> None:
@@ -2153,10 +2185,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_button.setEnabled(connected)
         self.configure_scan_button.setEnabled(connected)
         self.start_scan_button.setEnabled(connected)
-        self.apply_single_config_button.setEnabled(connected)
         self.single_measure_button.setEnabled(connected)
-        self.apply_sweep_config_button.setEnabled(connected)
-        self.start_debug_sweep_button.setEnabled(connected)
+        self.start_debug_sweep_button.setEnabled(connected and self.debug_probe_type == ProbeType.ROTARY_DEBUG)
         self._update_debug_probe_mode_ui()
         if not connected:
             self.connection_label.setText(self._tr("disconnected"))
@@ -2164,6 +2194,31 @@ class MainWindow(QtWidgets.QMainWindow):
     def _estimated_scan_points(self) -> int:
         step = max(1, int(round(self.scan_step_spin.value() * 100.0)))
         return max(1, (36000 + step - 1) // step)
+
+    def _normalize_motor_angle_degrees(self, value: float) -> float:
+        value = min(max(value, 0.0), MOTOR_MAX_ANGLE_DEG)
+        steps = round(value / MOTOR_ANGLE_RESOLUTION_DEG)
+        return min(max(steps * MOTOR_ANGLE_RESOLUTION_DEG, 0.0), MOTOR_MAX_ANGLE_DEG)
+
+    def _normalize_motor_step_degrees(self, value: float) -> float:
+        value = min(max(value, SIDE_SCAN_MIN_STEP_DEG), SIDE_SCAN_MAX_STEP_DEG)
+        steps = round(value / MOTOR_ANGLE_RESOLUTION_DEG)
+        normalized = steps * MOTOR_ANGLE_RESOLUTION_DEG
+        return min(max(normalized, SIDE_SCAN_MIN_STEP_DEG), SIDE_SCAN_MAX_STEP_DEG)
+
+    def _set_spinbox_value_if_needed(self, widget: QtWidgets.QDoubleSpinBox, value: float) -> None:
+        if abs(widget.value() - value) < 0.0005:
+            return
+        widget.blockSignals(True)
+        widget.setValue(value)
+        widget.blockSignals(False)
+
+    def _normalize_scan_step_input(self) -> None:
+        normalized = self._normalize_motor_step_degrees(self.scan_step_spin.value())
+        self._set_spinbox_value_if_needed(self.scan_step_spin, normalized)
+        self.last_point_count = self._estimated_scan_points()
+        self._update_expected_points_label()
+        self._update_progress_widgets()
 
     def _update_expected_points_label(self) -> None:
         value = self.last_point_count if self.last_point_count else "n/a"
@@ -2243,7 +2298,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return text.split(":", 1)[1].strip() or "n/a"
 
     def _format_angle_value(self, angle: int) -> str:
-        return f"{angle / 100.0:.2f} deg"
+        return f"{angle / 100.0:.3f} deg"
 
     def _simulate_front_distance(self, next_axial: bool = False) -> float:
         axial_position = self.axial_position_mm - (self.axial_step_spin.value() if next_axial else 0.0)
