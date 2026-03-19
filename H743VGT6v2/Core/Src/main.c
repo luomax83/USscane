@@ -156,6 +156,9 @@ volatile uint32_t g_debug_motor_status = 0U;
 volatile int32_t g_debug_motor_actual_steps = 0;
 volatile uint32_t g_debug_motor_target_angle = 0U;
 volatile uint32_t g_debug_motor_arrived_angle = 0U;
+static volatile uint32_t g_capture_started_cycles = 0U;
+static volatile uint32_t g_capture_finished_cycles = 0U;
+static volatile uint32_t g_last_capture_sample_rate_hz = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -214,6 +217,10 @@ static uint16_t App_ClampSideScanStepCdeg(uint16_t step_cdeg);
 static uint16_t App_NormalizeSideScanAngleCdeg(uint16_t angle_cdeg);
 static uint16_t App_NormalizeMotorAngleCdeg(uint16_t angle_cdeg);
 static uint16_t App_NormalizeMotorStepCdeg(uint16_t step_cdeg);
+static void App_EnableCycleCounter(void);
+static uint32_t App_GetApb1TimerKernelClockHz(void);
+static uint32_t App_GetCaptureSampleRateHz(void);
+static uint32_t App_GetValidatedCaptureSampleRateHz(void);
 static SonarResultCode App_UpdateCurrentAngleFromMotor(void);
 static uint16_t App_ComputeSingleTurnStepDelta(uint16_t lhs, uint16_t rhs);
 static SonarResultCode App_WaitMotorForStopBySteps(uint32_t timeout_ms, uint16_t *arrived_angle);
@@ -581,6 +588,67 @@ static uint16_t App_NormalizeMotorStepCdeg(uint16_t step_cdeg)
   }
 
   return normalized;
+}
+
+static void App_EnableCycleCounter(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0U;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+static uint32_t App_GetApb1TimerKernelClockHz(void)
+{
+  RCC_ClkInitTypeDef clock_config = {0};
+  uint32_t flash_latency = 0U;
+  uint32_t hclk_hz = HAL_RCC_GetHCLKFreq();
+  uint32_t pclk1_hz = HAL_RCC_GetPCLK1Freq();
+  uint32_t timer_prescaler = READ_BIT(RCC->CFGR, RCC_CFGR_TIMPRE);
+
+  HAL_RCC_GetClockConfig(&clock_config, &flash_latency);
+
+  if (timer_prescaler == RCC_TIMPRES_DESACTIVATED)
+  {
+    if ((clock_config.APB1CLKDivider == RCC_APB1_DIV1) || (clock_config.APB1CLKDivider == RCC_APB1_DIV2))
+    {
+      return hclk_hz;
+    }
+
+    return (2U * pclk1_hz);
+  }
+
+  if ((clock_config.APB1CLKDivider == RCC_APB1_DIV1) ||
+      (clock_config.APB1CLKDivider == RCC_APB1_DIV2) ||
+      (clock_config.APB1CLKDivider == RCC_APB1_DIV4))
+  {
+    return hclk_hz;
+  }
+
+  return (4U * pclk1_hz);
+}
+
+static uint32_t App_GetCaptureSampleRateHz(void)
+{
+  uint32_t timer_clock_hz = App_GetApb1TimerKernelClockHz();
+  uint32_t prescaler = htim4.Init.Prescaler + 1U;
+  uint32_t period = htim4.Init.Period + 1U;
+
+  if ((timer_clock_hz == 0U) || (prescaler == 0U) || (period == 0U))
+  {
+    return 0U;
+  }
+
+  return timer_clock_hz / (prescaler * period);
+}
+
+static uint32_t App_GetValidatedCaptureSampleRateHz(void)
+{
+  if (g_last_capture_sample_rate_hz != 0U)
+  {
+    return g_last_capture_sample_rate_hz;
+  }
+
+  return App_GetCaptureSampleRateHz();
 }
 
 static SonarResultCode App_UpdateCurrentAngleFromMotor(void)
@@ -976,7 +1044,7 @@ static void App_HandleConfigScan(uint16_t sequence, const uint8_t *payload, uint
 
 static void App_HandleConfigDebug(uint16_t sequence, const uint8_t *payload, uint16_t payload_length)
 {
-  uint8_t detail[2] = {1U, 1U};
+  uint8_t detail[6] = {1U, 1U, 0U, 0U, 0U, 0U};
   uint16_t original_start = 0U;
   uint16_t original_end = 0U;
   uint16_t original_step = 0U;
@@ -1072,6 +1140,7 @@ static void App_HandleConfigDebug(uint16_t sequence, const uint8_t *payload, uin
   detail[1] = ((original_start != g_sonar_app.debug_config.start_angle) ||
                (original_end != g_sonar_app.debug_config.end_angle) ||
                (original_step != g_sonar_app.debug_config.step_angle)) ? 1U : 0U;
+  App_WriteU32(&detail[2], App_GetCaptureSampleRateHz());
   App_SendAck(sequence, SONAR_CMD_CONFIG_DEBUG, detail, sizeof(detail));
 }
 
@@ -1620,10 +1689,11 @@ static void App_ProcessDepthUpload(void)
   }
 
   {
-    uint8_t finish_payload[5];
+    uint8_t finish_payload[9];
     App_WriteU16(&finish_payload[0], g_depth_upload.angle);
     App_WriteU16(&finish_payload[2], g_depth_upload.sample_count);
     finish_payload[4] = 0U;
+    App_WriteU32(&finish_payload[5], App_GetValidatedCaptureSampleRateHz());
     App_SendFrame(SONAR_CMD_WAVE_FINISH, g_depth_upload.sequence, finish_payload, sizeof(finish_payload));
   }
 
@@ -1679,9 +1749,9 @@ static uint32_t App_CalculateDistanceMmFromSamples(const uint16_t *samples, uint
   const uint16_t baseline_window = 128U;
   const uint16_t blind_zone_samples = 550U;
   const uint16_t threshold_counts = 500U;
-  const float sample_rate_hz = 3000000.0f;
+  const float sample_rate_hz = (float)App_GetValidatedCaptureSampleRateHz();
 
-  if ((samples == NULL) || (sample_count < (blind_zone_samples + 2U)))
+  if ((samples == NULL) || (sample_count < (blind_zone_samples + 2U)) || (sample_rate_hz <= 0.0f))
   {
     return 0U;
   }
@@ -1760,10 +1830,11 @@ static void App_SendWaveFromBuffer(uint16_t sequence, uint16_t angle, uint8_t bu
   }
 
   {
-    uint8_t finish_payload[5];
+    uint8_t finish_payload[9];
     App_WriteU16(&finish_payload[0], angle);
     App_WriteU16(&finish_payload[2], sample_count);
     finish_payload[4] = 0U;
+    App_WriteU32(&finish_payload[5], App_GetValidatedCaptureSampleRateHz());
     App_SendFrame(SONAR_CMD_WAVE_FINISH, sequence, finish_payload, sizeof(finish_payload));
   }
 }
@@ -2153,6 +2224,9 @@ static void App_StartDepthCapture(uint16_t sequence)
   g_depth_capture_timeout = 0U;
   g_depth_capture_active = 1U;
   g_depth_pulse_count = 0U;
+  g_capture_started_cycles = 0U;
+  g_capture_finished_cycles = 0U;
+  g_last_capture_sample_rate_hz = 0U;
   g_depth_capture_buffer_index = buffer_index;
   g_depth_completed_buffer_index = DEPTH_BUFFER_INVALID;
   g_depth_timeout_buffer_index = DEPTH_BUFFER_INVALID;
@@ -2210,6 +2284,7 @@ static void App_StartDepthCapture(uint16_t sequence)
     App_SendStatusEvent(0xE2U, 0U);
     return;
   }
+  g_capture_started_cycles = DWT->CYCCNT;
 
   if (HAL_TIM_PWM_Start(&htim3, g_active_capture_pwm_channel) != HAL_OK)
   {
@@ -2374,6 +2449,25 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
   if ((g_depth_capture_active != 0U) && (g_active_capture_adc != NULL) && (hadc->Instance == g_active_capture_adc->Instance))
   {
+    uint8_t buffer_index = g_depth_capture_buffer_index;
+    uint16_t sample_count = DEPTH_SAMPLE_COUNT;
+
+    g_capture_finished_cycles = DWT->CYCCNT;
+    if (buffer_index < DEPTH_BUFFER_COUNT)
+    {
+      sample_count = g_depth_buffer_slots[buffer_index].sample_count;
+    }
+    if ((g_capture_started_cycles != 0U) && (g_capture_finished_cycles != g_capture_started_cycles) && (sample_count != 0U))
+    {
+      uint32_t core_clock_hz = HAL_RCC_GetSysClockFreq();
+      uint32_t elapsed_cycles = g_capture_finished_cycles - g_capture_started_cycles;
+
+      if ((core_clock_hz != 0U) && (elapsed_cycles != 0U))
+      {
+        g_last_capture_sample_rate_hz = (uint32_t)((((uint64_t)sample_count * (uint64_t)core_clock_hz) + ((uint64_t)elapsed_cycles / 2ULL)) / (uint64_t)elapsed_cycles);
+      }
+    }
+
     g_depth_completed_buffer_index = g_depth_capture_buffer_index;
     g_depth_capture_buffer_index = DEPTH_BUFFER_INVALID;
     App_StopDepthCapture();
@@ -2468,6 +2562,7 @@ int main(void)
   {
     Error_Handler();
   }
+  App_EnableCycleCounter();
   App_StartUartReception();
 
   /* USER CODE END 2 */

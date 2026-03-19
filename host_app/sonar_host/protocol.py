@@ -231,10 +231,13 @@ def parse_debug_config_ack_detail(detail: bytes) -> dict[str, int]:
     if len(detail) < 2:
         raise ValueError("debug config ack detail too short")
     accepted, normalized = unpack_from("<BB", detail, 0)
-    return {
+    result = {
         "accepted": accepted,
         "normalized": normalized,
     }
+    if len(detail) >= 6:
+        result["sample_rate_hz"] = unpack_from("<I", detail, 2)[0]
+    return result
 
 
 def parse_move_to_angle_ack_detail(detail: bytes) -> dict[str, int]:
@@ -299,11 +302,14 @@ def parse_wave_finish(payload: bytes) -> dict[str, int]:
     if len(payload) < 5:
         raise ValueError("wave finish payload too short")
     angle, total_samples, result = unpack_from("<HHB", payload, 0)
-    return {
+    parsed = {
         "angle": angle,
         "total_samples": total_samples,
         "result": result,
     }
+    if len(payload) >= 9:
+        parsed["sample_rate_hz"] = unpack_from("<I", payload, 5)[0]
+    return parsed
 
 
 def parse_distance_result(payload: bytes) -> DistanceResult:

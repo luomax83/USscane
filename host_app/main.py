@@ -153,6 +153,7 @@ TEXTS = {
         "depth_probe": "Depth Probe",
         "rotary_probe": "Side-scan Probe",
         "pulse_count": "Pulse Count",
+        "sample_rate": "Sample Rate",
         "debug_sound_speed": "Wave Speed",
         "sweep_start": "Sweep Start",
         "sweep_end": "Sweep End",
@@ -241,6 +242,7 @@ TEXTS = {
         "depth_probe": "测深度探头",
         "rotary_probe": "侧扫探头",
         "pulse_count": "脉冲数量",
+        "sample_rate": "采样率",
         "debug_sound_speed": "波速",
         "sweep_start": "起始角",
         "sweep_end": "结束角",
@@ -522,7 +524,7 @@ class SessionRecorder:
             [f"{result.angle / 100.0:.2f}", result.distance_mm, result.quality, int(result.valid)],
         )
 
-    def save_waveform(self, *, angle: int, data_type: WaveDataType, raw_bytes: bytes, sample_count: int, sound_speed_m_s: int) -> None:
+    def save_waveform(self, *, angle: int, data_type: WaveDataType, raw_bytes: bytes, sample_count: int, sound_speed_m_s: int, sample_rate_hz: float) -> None:
         if self.session_dir is None:
             return
 
@@ -538,6 +540,7 @@ class SessionRecorder:
                     "data_type": data_type.name,
                     "sample_count": sample_count,
                     "sound_speed_m_s": sound_speed_m_s,
+                    "sample_rate_hz": sample_rate_hz,
                     "bin_file": bin_path.name,
                     "csv_file": csv_path.name,
                 },
@@ -554,7 +557,7 @@ class SessionRecorder:
                 writer = csv.writer(handle)
                 writer.writerow(["sample_index", "time_us", "distance_mm", "raw_code", "voltage_v"])
                 for index, value in enumerate(samples):
-                    time_us = (index / WAVE_SAMPLE_RATE_HZ) * 1_000_000.0
+                    time_us = (index / sample_rate_hz) * 1_000_000.0
                     distance_mm = time_us * float(sound_speed_m_s) / 2000.0
                     voltage_v = float(value) * ADC_REFERENCE_VOLTAGE / ADC_FULL_SCALE
                     writer.writerow([index, f"{time_us:.6f}", f"{distance_mm:.6f}", value, f"{voltage_v:.6f}"])
@@ -564,14 +567,14 @@ class SessionRecorder:
                 writer = csv.writer(handle)
                 writer.writerow(["sample_index", "time_us", "distance_mm", "value"])
                 for index, value in enumerate(samples):
-                    time_us = (index / WAVE_SAMPLE_RATE_HZ) * 1_000_000.0
+                    time_us = (index / sample_rate_hz) * 1_000_000.0
                     distance_mm = time_us * float(sound_speed_m_s) / 2000.0
                     writer.writerow([index, f"{time_us:.6f}", f"{distance_mm:.6f}", value])
 
         self._append_csv(
             "wave_index.csv",
-            ["angle_deg", "data_type", "sample_count", "sound_speed_m_s", "bin_file", "json_file", "csv_file"],
-            [f"{angle / 100.0:.2f}", data_type.name, sample_count, sound_speed_m_s, bin_path.name, meta_path.name, csv_path.name],
+            ["angle_deg", "data_type", "sample_count", "sound_speed_m_s", "sample_rate_hz", "bin_file", "json_file", "csv_file"],
+            [f"{angle / 100.0:.2f}", data_type.name, sample_count, sound_speed_m_s, f"{sample_rate_hz:.3f}", bin_path.name, meta_path.name, csv_path.name],
         )
 
     def _append_csv(self, filename: str, header: list[str], row: list[Any]) -> None:
@@ -736,7 +739,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_wave_data_type = WaveDataType.U8_RAW
         self.current_wave_samples: list[int] = []
         self.current_wave_display_samples: list[float] = []
+        self.wave_capture_history: list[dict[str, Any]] = []
         self.wave_streams: dict[int, dict[str, Any]] = {}
+        self.runtime_sample_rate_hz = WAVE_SAMPLE_RATE_HZ
+        self.measured_sample_rate_hz = 0.0
         self.debug_probe_type = ProbeType.DEPTH_PROBE
         self.lap_count = 0
         self.rings_at_position = 0
@@ -1150,6 +1156,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.debug_arrived_label = QtWidgets.QLabel("Arrived: n/a")
         self.debug_distance_label = QtWidgets.QLabel("Distance: n/a")
         self.debug_quality_label = QtWidgets.QLabel("Quality: n/a")
+        self.debug_sample_rate_label = QtWidgets.QLabel("Sample Rate: n/a")
         self.wave_info_label = QtWidgets.QLabel("Wave: n/a")
         self.debug_session_label = QtWidgets.QLabel("Idle")
         result_form.addRow(self.debug_target_label)
@@ -1157,6 +1164,7 @@ class MainWindow(QtWidgets.QMainWindow):
         result_form.addRow(self.debug_arrived_label)
         result_form.addRow(self.debug_distance_label)
         result_form.addRow(self.debug_quality_label)
+        result_form.addRow(self.debug_sample_rate_label)
         result_form.addRow(self.wave_info_label)
         self.debug_session_title = QtWidgets.QLabel()
         result_form.addRow(self.debug_session_title, self.debug_session_label)
@@ -1297,6 +1305,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.debug_arrived_label.setText(self._tr("arrived", value=self._suffix_after_colon(self.debug_arrived_label.text())))
         self.debug_distance_label.setText(self._tr("distance", value=self._suffix_after_colon(self.debug_distance_label.text())))
         self.debug_quality_label.setText(self._tr("quality", value=self._suffix_after_colon(self.debug_quality_label.text())))
+        self._update_debug_sample_rate_label()
         self.wave_info_label.setText(self._tr("wave", value=self._suffix_after_colon(self.wave_info_label.text())))
 
         self.wave_plot.setTitle(self._tr("wave_plot_title"))
@@ -1545,9 +1554,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _start_single_measure(self) -> None:
         self.debug_started_at = time.time()
+        self.measured_sample_rate_hz = 0.0
         self.current_wave_bytes = b""
         self.current_wave_samples.clear()
         self.current_wave_display_samples.clear()
+        self.wave_capture_history.clear()
         self.wave_streams.clear()
         self.wave_curve.setData([], [])
         self._set_mode("Debug Single")
@@ -1564,6 +1575,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.current_debug_points.clear()
         self.debug_started_at = time.time()
+        self.measured_sample_rate_hz = 0.0
+        self.current_wave_bytes = b""
+        self.current_wave_samples.clear()
+        self.current_wave_display_samples.clear()
+        self.wave_capture_history.clear()
+        self.wave_streams.clear()
+        self.wave_curve.setData([], [])
         self._reset_debug_views()
         self._set_mode("Debug Sweep")
         self.debug_session_label.setText("Debug sweep running.")
@@ -1624,8 +1642,47 @@ class MainWindow(QtWidgets.QMainWindow):
         return text.replace(".", "p")
 
     def _save_wave_csv(self) -> None:
-        if not self.current_wave_samples:
+        if not self.current_wave_samples and not self.wave_capture_history:
             self._append_log("Save skipped: no waveform available.")
+            return
+
+        if len(self.wave_capture_history) > 1:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            default_dir = APP_DIR / f"wave_sweep_{stamp}"
+            target_dir = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                "Save Sweep Waveforms",
+                str(default_dir.parent),
+            )
+            if not target_dir:
+                return
+            output_dir = Path(target_dir) / default_dir.name
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            index_path = output_dir / "wave_index.csv"
+            with index_path.open("w", newline="", encoding="utf-8") as index_handle:
+                index_writer = csv.writer(index_handle)
+                index_writer.writerow(["wave_index", "angle_deg", "data_type", "sample_count", "csv_file"])
+                for wave_index, wave in enumerate(self.wave_capture_history):
+                    filename = f"wave_{wave_index:03d}_{wave['angle']:05d}.csv"
+                    csv_path = output_dir / filename
+                    self._write_wave_csv(
+                        csv_path,
+                        wave["data_type"],
+                        wave["samples"],
+                        float(wave.get("sample_rate_hz", self._effective_wave_sample_rate_hz())),
+                    )
+                    index_writer.writerow(
+                        [
+                            wave_index,
+                            f"{wave['angle'] / 100.0:.2f}",
+                            wave["data_type"].name,
+                            len(wave["samples"]),
+                            filename,
+                        ]
+                    )
+
+            self._append_log(f"Saved {len(self.wave_capture_history)} sweep waveforms: {output_dir}")
             return
 
         suggested = f"wave_{self.current_wave_angle:05d}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
@@ -1638,12 +1695,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
 
-        with open(path, "w", newline="", encoding="utf-8") as handle:
+        self._write_wave_csv(Path(path), self.current_wave_data_type, self.current_wave_samples, self._effective_wave_sample_rate_hz())
+        self._append_log(f"Saved waveform CSV: {path}")
+
+    def _write_wave_csv(self, path: Path, data_type: WaveDataType, samples: list[int], sample_rate_hz: float) -> None:
+        with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
-            if self.current_wave_data_type in (WaveDataType.U16_RAW, WaveDataType.U16_ENVELOPE):
+            if data_type in (WaveDataType.U16_RAW, WaveDataType.U16_ENVELOPE):
                 writer.writerow(["sample_index", "time_us", "distance_mm", "raw_code", "voltage_v"])
-                for index, value in enumerate(self.current_wave_samples):
-                    time_us = self._sample_index_to_time_us(index)
+                for index, value in enumerate(samples):
+                    time_us = (float(index) / sample_rate_hz) * 1_000_000.0
                     writer.writerow(
                         [
                             index,
@@ -1655,10 +1716,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
             else:
                 writer.writerow(["sample_index", "time_us", "distance_mm", "value"])
-                for index, value in enumerate(self.current_wave_samples):
-                    time_us = self._sample_index_to_time_us(index)
+                for index, value in enumerate(samples):
+                    time_us = (float(index) / sample_rate_hz) * 1_000_000.0
                     writer.writerow([index, f"{time_us:.6f}", f"{self._time_us_to_distance_mm(time_us):.6f}", value])
-        self._append_log(f"Saved waveform CSV: {path}")
 
     def _send_packet(self, packet: bytes, label: str) -> None:
         if self.worker is None or not self.worker.isRunning():
@@ -1768,6 +1828,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if ref_cmd == CommandId.CONFIG_DEBUG:
             debug_info = parse_debug_config_ack_detail(detail)
+            sample_rate_hz = int(debug_info.get("sample_rate_hz", WAVE_SAMPLE_RATE_HZ))
+            if sample_rate_hz > 0:
+                self.runtime_sample_rate_hz = float(sample_rate_hz)
+                self.measured_sample_rate_hz = 0.0
+                self._refresh_wave_plot_axes()
+            self._update_debug_sample_rate_label()
             self.debug_session_label.setText(
                 f"Debug config accepted={debug_info['accepted']} normalized={debug_info['normalized']}"
             )
@@ -1897,6 +1963,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log("Wave finish received without matching chunks.")
             return
 
+        measured_sample_rate_hz = int(finish.get("sample_rate_hz", 0))
+        if measured_sample_rate_hz > 0:
+            self.measured_sample_rate_hz = float(measured_sample_rate_hz)
+            self._update_debug_sample_rate_label()
+
         total_frames = int(stream["total_frames"])
         chunks = stream["chunks"]
         raw_bytes = b"".join(chunks[index] for index in range(total_frames) if index in chunks)
@@ -1909,6 +1980,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_wave_bytes = raw_bytes
         self.current_wave_samples = self._decode_wave_samples(data_type, raw_bytes)
         self.current_wave_display_samples = self._wave_samples_to_display(data_type, self.current_wave_samples)
+        self.wave_capture_history.append(
+            {
+                "angle": finish["angle"],
+                "data_type": data_type,
+                "samples": list(self.current_wave_samples),
+                "raw_bytes": raw_bytes,
+                "sample_rate_hz": self._effective_wave_sample_rate_hz(),
+            }
+        )
         x_values = [self._sample_index_to_time_us(index) for index in range(len(self.current_wave_display_samples))]
         self.wave_curve.setData(x_values, self.current_wave_display_samples)
         self.wave_plot.setLabel("left", self._wave_axis_label(data_type))
@@ -1926,6 +2006,7 @@ class MainWindow(QtWidgets.QMainWindow):
             raw_bytes=raw_bytes,
             sample_count=finish["total_samples"],
             sound_speed_m_s=self.debug_sound_speed_spin.value(),
+            sample_rate_hz=self._effective_wave_sample_rate_hz(),
         )
 
     def _handle_debug_sweep_point(self, frame: Frame) -> None:
@@ -2154,6 +2235,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _reset_debug_views(self) -> None:
         self.debug_table.setRowCount(0)
         self.debug_sweep_curve.setData([], [])
+        self._update_debug_sample_rate_label()
 
     def _set_device_status(self, status: DeviceStatus) -> None:
         self.device_status = status
@@ -2178,6 +2260,24 @@ class MainWindow(QtWidgets.QMainWindow):
         event_prefix = self._tr("event_none").split(":", 1)[0]
         self.event_label.setText(f"{event_prefix}: {text}")
         self._append_log(text)
+
+    def _effective_wave_sample_rate_hz(self) -> float:
+        if self.measured_sample_rate_hz > 0.0:
+            return self.measured_sample_rate_hz
+        if self.runtime_sample_rate_hz > 0.0:
+            return self.runtime_sample_rate_hz
+        return WAVE_SAMPLE_RATE_HZ
+
+    def _update_debug_sample_rate_label(self) -> None:
+        if self.measured_sample_rate_hz > 0.0:
+            text = (
+                f"{self._tr('sample_rate')}: "
+                f"cfg {self.runtime_sample_rate_hz / 1_000_000.0:.6f} MHz / "
+                f"meas {self.measured_sample_rate_hz / 1_000_000.0:.6f} MHz"
+            )
+        else:
+            text = f"{self._tr('sample_rate')}: {self.runtime_sample_rate_hz / 1_000_000.0:.6f} MHz"
+        self.debug_sample_rate_label.setText(text)
 
     def _set_transport_connected(self, connected: bool) -> None:
         self.info_button.setEnabled(connected)
@@ -2394,7 +2494,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return "Amplitude"
 
     def _sample_index_to_time_us(self, index: int) -> float:
-        return (float(index) / WAVE_SAMPLE_RATE_HZ) * 1_000_000.0
+        return (float(index) / self._effective_wave_sample_rate_hz()) * 1_000_000.0
 
     def _time_us_to_distance_mm(self, time_us: float) -> float:
         return time_us * float(self.debug_sound_speed_spin.value()) / 2000.0
