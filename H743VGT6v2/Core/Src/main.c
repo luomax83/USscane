@@ -45,8 +45,9 @@
 #define DEBUG_PROBE_TYPE_DEPTH 0x01U
 #define MOTOR_SLAVE_ADDRESS 0x01U
 #define MOTOR_SINGLE_TURN_STEPS 6400U
-#define MOTOR_MOVE_SPEED_RPM 100U
-#define MOTOR_HOME_SPEED_RPM 100U
+#define MOTOR_MICROSTEPS_PER_FULL_STEP 32U
+#define MOTOR_MOVE_SPEED_RPM 500U
+#define MOTOR_HOME_SPEED_RPM 500U
 #define MOTOR_MOTION_TIMEOUT_MS 15000U
 #define MOTOR_FORWARD_START_SPEED_RPM_X10 300U
 #define MOTOR_FORWARD_MAX_SPEED_RPM 500U
@@ -55,7 +56,7 @@
 #define MOTOR_STOP_STABLE_POLLS 4U
 #define MOTOR_TARGET_STABLE_POLLS 3U
 #define MOTOR_STABLE_STEP_TOLERANCE 4U
-#define MOTOR_TARGET_STEP_TOLERANCE 16U
+#define MOTOR_TARGET_STEP_TOLERANCE 8U
 #define MOTOR_SIDE_SCAN_ANGLE_QUANTUM_CDEG 180U
 #define MOTOR_MIN_SIDE_SCAN_STEP_CDEG MOTOR_SIDE_SCAN_ANGLE_QUANTUM_CDEG
 #define MOTOR_MAX_SIDE_SCAN_STEP_CDEG 1980U
@@ -225,6 +226,9 @@ static SonarResultCode App_UpdateCurrentAngleFromMotor(void);
 static uint16_t App_ComputeSingleTurnStepDelta(uint16_t lhs, uint16_t rhs);
 static SonarResultCode App_WaitMotorForStopBySteps(uint32_t timeout_ms, uint16_t *arrived_angle);
 static SonarResultCode App_WaitMotorForTargetBySteps(uint16_t target_angle, uint32_t timeout_ms, uint16_t *arrived_angle);
+static SonarResultCode App_ReadMotorState(uint16_t *status, uint16_t *current_angle);
+static uint8_t App_IsMotorStoppedStatus(uint16_t status);
+static uint8_t App_IsMotorHomeCompleteStatus(uint16_t status);
 static SonarResultCode App_ZeroMotorBlocking(void);
 static SonarResultCode App_MoveMotorToAngleBlocking(uint16_t target_angle, uint8_t *move_dir, uint16_t *arrived_angle);
 static SonarResultCode App_MoveMotorByAngleDeltaBlocking(int32_t angle_delta_cdeg, uint16_t *arrived_angle);
@@ -442,6 +446,9 @@ static void App_ProcessMotorDiagnostic(void)
   SonarResultCode result = SONAR_RESULT_OK;
   uint8_t move_dir = 0U;
   uint16_t arrived_angle = 0U;
+  uint16_t status = 0U;
+  int32_t actual_steps = 0;
+  MotorDriverResult driver_result = MOTOR_DRIVER_OK;
 
   if (request == 0U)
   {
@@ -458,21 +465,21 @@ static void App_ProcessMotorDiagnostic(void)
   switch (request)
   {
     case 1U:
-    {
-      uint16_t status = 0U;
-      MotorDriverResult driver_result = MotorDriver_ReadStatus(&g_motor_driver, &status);
+      driver_result = MotorDriver_ReadStatus(&g_motor_driver, &status);
       g_debug_motor_status = status;
       g_debug_motor_result = (uint32_t)driver_result;
       break;
-    }
     case 2U:
-    {
-      int32_t actual_steps = 0;
-      MotorDriverResult driver_result = MotorDriver_ReadActualSteps(&g_motor_driver, &actual_steps);
+      driver_result = MotorDriver_ReadActualSteps(&g_motor_driver, &actual_steps);
       g_debug_motor_actual_steps = actual_steps;
       g_debug_motor_result = (uint32_t)driver_result;
       break;
-    }
+    case 5U:
+      driver_result = MotorDriver_ReadStatusAndActualSteps(&g_motor_driver, &status, &actual_steps);
+      g_debug_motor_status = status;
+      g_debug_motor_actual_steps = actual_steps;
+      g_debug_motor_result = (uint32_t)driver_result;
+      break;
     case 3U:
       result = App_MoveMotorToAngleBlocking((uint16_t)g_debug_motor_target_angle, &move_dir, &arrived_angle);
       g_debug_motor_arrived_angle = arrived_angle;
@@ -493,13 +500,16 @@ static void App_ProcessMotorDiagnostic(void)
 static void App_InitMotorController(void)
 {
   int32_t actual_steps = 0;
+  uint16_t status = 0U;
 
   MotorDriver_Init(&g_motor_driver, &huart4, MOTOR_SLAVE_ADDRESS, MOTOR_SINGLE_TURN_STEPS);
   g_motor_driver.response_timeout_ms = 1000U;
   HAL_Delay(100U);
 
-  if (MotorDriver_ReadActualSteps(&g_motor_driver, &actual_steps) == MOTOR_DRIVER_OK)
+  if (MotorDriver_ReadStatusAndActualSteps(&g_motor_driver, &status, &actual_steps) == MOTOR_DRIVER_OK)
   {
+    g_debug_motor_status = status;
+    g_debug_motor_actual_steps = actual_steps;
     g_sonar_app.current_angle = MotorDriver_SingleTurnStepsToAngleCdeg(
         &g_motor_driver,
         MotorDriver_ActualStepsToSingleTurnSteps(&g_motor_driver, actual_steps));
@@ -654,13 +664,16 @@ static uint32_t App_GetValidatedCaptureSampleRateHz(void)
 static SonarResultCode App_UpdateCurrentAngleFromMotor(void)
 {
   int32_t actual_steps = 0;
-  MotorDriverResult result = MotorDriver_ReadActualSteps(&g_motor_driver, &actual_steps);
+  uint16_t status = 0U;
+  MotorDriverResult result = MotorDriver_ReadStatusAndActualSteps(&g_motor_driver, &status, &actual_steps);
 
   if (result != MOTOR_DRIVER_OK)
   {
     return App_MotorResultToSonarResult(result);
   }
 
+  g_debug_motor_status = status;
+  g_debug_motor_actual_steps = actual_steps;
   g_sonar_app.current_angle = MotorDriver_SingleTurnStepsToAngleCdeg(
       &g_motor_driver,
       MotorDriver_ActualStepsToSingleTurnSteps(&g_motor_driver, actual_steps));
@@ -679,6 +692,51 @@ static uint16_t App_ComputeSingleTurnStepDelta(uint16_t lhs, uint16_t rhs)
   return delta;
 }
 
+static SonarResultCode App_ReadMotorState(uint16_t *status, uint16_t *current_angle)
+{
+  int32_t actual_steps = 0;
+  uint16_t read_status = 0U;
+  MotorDriverResult status_result = MotorDriver_ReadStatusAndActualSteps(&g_motor_driver, &read_status, &actual_steps);
+
+  if (status_result != MOTOR_DRIVER_OK)
+  {
+    return App_MotorResultToSonarResult(status_result);
+  }
+
+  g_debug_motor_status = read_status;
+  g_debug_motor_actual_steps = actual_steps;
+  g_sonar_app.current_angle = MotorDriver_SingleTurnStepsToAngleCdeg(
+      &g_motor_driver,
+      MotorDriver_ActualStepsToSingleTurnSteps(&g_motor_driver, actual_steps));
+
+  if (status != NULL)
+  {
+    *status = read_status;
+  }
+
+  if (current_angle != NULL)
+  {
+    *current_angle = g_sonar_app.current_angle;
+  }
+
+  return SONAR_RESULT_OK;
+}
+
+static uint8_t App_IsMotorStoppedStatus(uint16_t status)
+{
+  return (status == MOTOR_STATUS_IDLE) ||
+         (status == MOTOR_STATUS_COLLISION_STOP) ||
+         (status == MOTOR_STATUS_POS_LIMIT_STOP) ||
+         (status == MOTOR_STATUS_NEG_LIMIT_STOP);
+}
+
+static uint8_t App_IsMotorHomeCompleteStatus(uint16_t status)
+{
+  return (status == MOTOR_STATUS_IDLE) ||
+         (status == MOTOR_STATUS_POS_LIMIT_STOP) ||
+         (status == MOTOR_STATUS_NEG_LIMIT_STOP);
+}
+
 static SonarResultCode App_WaitMotorForStopBySteps(uint32_t timeout_ms, uint16_t *arrived_angle)
 {
   uint32_t started_ms = HAL_GetTick();
@@ -690,23 +748,16 @@ static SonarResultCode App_WaitMotorForStopBySteps(uint32_t timeout_ms, uint16_t
 
   while ((HAL_GetTick() - started_ms) < timeout_ms)
   {
-    int32_t actual_steps = 0;
     uint16_t current_steps = 0U;
     uint16_t status = 0U;
-    MotorDriverResult status_result = MotorDriver_ReadStatus(&g_motor_driver, &status);
+    SonarResultCode state_result = App_ReadMotorState(&status, NULL);
 
-    if (status_result != MOTOR_DRIVER_OK)
+    if (state_result != SONAR_RESULT_OK)
     {
-      return App_MotorResultToSonarResult(status_result);
+      return state_result;
     }
 
-    if (MotorDriver_ReadActualSteps(&g_motor_driver, &actual_steps) != MOTOR_DRIVER_OK)
-    {
-      return SONAR_RESULT_HARDWARE_ERROR;
-    }
-
-    current_steps = MotorDriver_ActualStepsToSingleTurnSteps(&g_motor_driver, actual_steps);
-    g_sonar_app.current_angle = MotorDriver_SingleTurnStepsToAngleCdeg(&g_motor_driver, current_steps);
+    current_steps = MotorDriver_AngleCdegToSingleTurnSteps(&g_motor_driver, g_sonar_app.current_angle);
 
     if (has_last_steps != 0U)
     {
@@ -723,8 +774,12 @@ static SonarResultCode App_WaitMotorForStopBySteps(uint32_t timeout_ms, uint16_t
     last_steps = current_steps;
     has_last_steps = 1U;
 
-    if ((status == 0U) && (stable_polls >= MOTOR_STOP_STABLE_POLLS))
+    if ((App_IsMotorStoppedStatus(status) != 0U) && (stable_polls >= MOTOR_STOP_STABLE_POLLS))
     {
+      if ((status == MOTOR_STATUS_COLLISION_STOP) || (status == MOTOR_STATUS_POS_LIMIT_STOP) || (status == MOTOR_STATUS_NEG_LIMIT_STOP))
+      {
+        return MOTOR_STATUS_COLLISION_STOP == status ? SONAR_RESULT_FAIL : SONAR_RESULT_OK;
+      }
       if (arrived_angle != NULL)
       {
         *arrived_angle = g_sonar_app.current_angle;
@@ -748,28 +803,26 @@ static SonarResultCode App_WaitMotorForTargetBySteps(uint16_t target_angle, uint
 
   while ((HAL_GetTick() - started_ms) < timeout_ms)
   {
-    int32_t actual_steps = 0;
     uint16_t current_steps = 0U;
     uint16_t status = 0U;
-    MotorDriverResult status_result = MotorDriver_ReadStatus(&g_motor_driver, &status);
+    SonarResultCode state_result = App_ReadMotorState(&status, NULL);
 
-    if (status_result != MOTOR_DRIVER_OK)
+    if (state_result != SONAR_RESULT_OK)
     {
-      return App_MotorResultToSonarResult(status_result);
+      return state_result;
     }
 
-    if (MotorDriver_ReadActualSteps(&g_motor_driver, &actual_steps) != MOTOR_DRIVER_OK)
-    {
-      return SONAR_RESULT_HARDWARE_ERROR;
-    }
+    current_steps = MotorDriver_AngleCdegToSingleTurnSteps(&g_motor_driver, g_sonar_app.current_angle);
 
-    current_steps = MotorDriver_ActualStepsToSingleTurnSteps(&g_motor_driver, actual_steps);
-    g_sonar_app.current_angle = MotorDriver_SingleTurnStepsToAngleCdeg(&g_motor_driver, current_steps);
+    if ((status == MOTOR_STATUS_COLLISION_STOP) || (status == MOTOR_STATUS_POS_LIMIT_STOP) || (status == MOTOR_STATUS_NEG_LIMIT_STOP))
+    {
+      return SONAR_RESULT_FAIL;
+    }
 
     if (App_ComputeSingleTurnStepDelta(current_steps, target_steps) <= MOTOR_TARGET_STEP_TOLERANCE)
     {
       stable_polls++;
-      if ((status == 0U) && (stable_polls >= MOTOR_TARGET_STABLE_POLLS))
+      if ((status == MOTOR_STATUS_IDLE) && (stable_polls >= MOTOR_TARGET_STABLE_POLLS))
       {
         if (arrived_angle != NULL)
         {
@@ -791,21 +844,33 @@ static SonarResultCode App_WaitMotorForTargetBySteps(uint16_t target_angle, uint
 
 static SonarResultCode App_ZeroMotorBlocking(void)
 {
-  MotorDriverResult result = MotorDriver_Home(&g_motor_driver, MOTOR_HOME_SPEED_RPM);
-
+  MotorDriverResult result = MotorDriver_MoveSingleTurn(&g_motor_driver, 0U, MOTOR_HOME_SPEED_RPM, 0U);
+  SonarResultCode wait_result = SONAR_RESULT_OK;
+  uint16_t home_angle = 0U;
+  uint16_t status = 0U;
   if (App_AcceptMotorWriteResult(result) != SONAR_RESULT_OK)
   {
     return App_MotorResultToSonarResult(result);
   }
 
-  HAL_Delay(5000U);
-  result = MotorDriver_SetZero(&g_motor_driver);
-  if (App_AcceptMotorWriteResult(result) != SONAR_RESULT_OK)
+  HAL_Delay(150U);
+  wait_result = App_WaitMotorForTargetBySteps(0U, MOTOR_MOTION_TIMEOUT_MS, &home_angle);
+  if (wait_result != SONAR_RESULT_OK)
   {
-    return App_MotorResultToSonarResult(result);
+    return wait_result;
   }
 
-  HAL_Delay(200U);
+  wait_result = App_ReadMotorState(&status, &home_angle);
+  if (wait_result != SONAR_RESULT_OK)
+  {
+    return wait_result;
+  }
+
+  if (status != MOTOR_STATUS_IDLE)
+  {
+    return SONAR_RESULT_TIMEOUT;
+  }
+
   g_sonar_app.current_angle = 0U;
   g_sonar_app.target_angle = 0U;
   return SONAR_RESULT_OK;
@@ -817,6 +882,7 @@ static SonarResultCode App_MoveMotorToAngleBlocking(uint16_t target_angle, uint8
   uint16_t motor_steps = 0U;
   uint16_t current_angle = g_sonar_app.current_angle;
   MotorDriverResult result = MOTOR_DRIVER_OK;
+  SonarResultCode wait_result = SONAR_RESULT_OK;
 
   if (move_dir != NULL)
   {
@@ -840,26 +906,32 @@ static SonarResultCode App_MoveMotorToAngleBlocking(uint16_t target_angle, uint8
     return App_MotorResultToSonarResult(result);
   }
 
-  App_ServiceBackgroundTasks(App_EstimateMotorMoveWaitMs(
+  App_ServiceBackgroundTasks(80U);
+  wait_result = App_WaitMotorForTargetBySteps(
+      normalized_angle,
+      App_EstimateMotorMoveWaitMs(
       (int32_t)MotorDriver_AngleCdegToSingleTurnSteps(&g_motor_driver, normalized_angle) -
       (int32_t)MotorDriver_AngleCdegToSingleTurnSteps(&g_motor_driver, current_angle),
       MOTOR_MOVE_SPEED_RPM,
-      200U));
-  g_sonar_app.current_angle = normalized_angle;
+      200U),
+      arrived_angle);
+  if (wait_result != SONAR_RESULT_OK)
+  {
+    return wait_result;
+  }
+
+  g_sonar_app.current_angle = (arrived_angle != NULL) ? *arrived_angle : g_sonar_app.current_angle;
   g_sonar_app.target_angle = normalized_angle;
   if (arrived_angle != NULL)
   {
-    *arrived_angle = normalized_angle;
+    *arrived_angle = g_sonar_app.current_angle;
   }
   return SONAR_RESULT_OK;
 }
 
 static SonarResultCode App_MoveMotorByAngleDeltaBlocking(int32_t angle_delta_cdeg, uint16_t *arrived_angle)
 {
-  int64_t step_delta = 0;
-  uint32_t wait_ms = 0U;
   int32_t target_angle = 0;
-  MotorDriverResult result = MOTOR_DRIVER_OK;
 
   if (angle_delta_cdeg == 0)
   {
@@ -870,39 +942,14 @@ static SonarResultCode App_MoveMotorByAngleDeltaBlocking(int32_t angle_delta_cde
     return SONAR_RESULT_OK;
   }
 
-  step_delta = ((int64_t)angle_delta_cdeg * (int64_t)MOTOR_SINGLE_TURN_STEPS) / 36000LL;
-  if (step_delta == 0)
-  {
-    step_delta = (angle_delta_cdeg > 0) ? 1 : -1;
-  }
-
-  result = MotorDriver_MoveForwardSteps(
-      &g_motor_driver,
-      (int32_t)step_delta,
-      MOTOR_FORWARD_START_SPEED_RPM_X10,
-      MOTOR_FORWARD_MAX_SPEED_RPM,
-      MOTOR_FORWARD_ACCEL_TIME_MS,
-      MOTOR_FORWARD_TOLERANCE_STEPS);
-  if (App_AcceptMotorWriteResult(result) != SONAR_RESULT_OK)
-  {
-    return App_MotorResultToSonarResult(result);
-  }
-
-  wait_ms = App_EstimateMotorMoveWaitMs((int32_t)step_delta, MOTOR_FORWARD_MAX_SPEED_RPM, MOTOR_FORWARD_ACCEL_TIME_MS);
-  App_ServiceBackgroundTasks(wait_ms);
   target_angle = (int32_t)g_sonar_app.current_angle + angle_delta_cdeg;
   while (target_angle < 0)
   {
     target_angle += 36000;
   }
   target_angle %= 36000;
-  g_sonar_app.current_angle = App_NormalizeMotorAngleCdeg((uint16_t)target_angle);
-  if (arrived_angle != NULL)
-  {
-    *arrived_angle = g_sonar_app.current_angle;
-  }
-
-  return SONAR_RESULT_OK;
+  target_angle = (int32_t)App_NormalizeMotorAngleCdeg((uint16_t)target_angle);
+  return App_MoveMotorToAngleBlocking((uint16_t)target_angle, NULL, arrived_angle);
 }
 
 static uint32_t App_EstimateMotorMoveWaitMs(int32_t step_delta, uint16_t speed_rpm, uint16_t accel_time_ms)
