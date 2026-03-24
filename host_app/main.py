@@ -72,6 +72,7 @@ MOTOR_MAX_ANGLE_DEG = 360.0 - MOTOR_ANGLE_RESOLUTION_DEG
 SIDE_SCAN_MIN_STEP_DEG = 1.8
 SIDE_SCAN_DEFAULT_STEP_DEG = 5.4
 SIDE_SCAN_MAX_STEP_DEG = 19.8
+DEBUG_SAMPLE_COUNT_OPTIONS = (7500, 25000)
 ANGLE_DISPLAY_DECIMALS = 3
 
 EVENT_LABELS = {
@@ -194,93 +195,93 @@ TEXTS = {
         "lang_en": "English",
     },
     "zh": {
-        "window_title": "超声声纳上位机",
-        "port": "端口",
-        "baud": "波特率",
-        "connect": "连接",
-        "disconnect": "断开",
-        "refresh": "刷新",
-        "get_info": "读取信息",
-        "zeroing": "回零",
-        "stop": "停止",
-        "start_record": "开始记录",
-        "stop_record": "停止记录",
-        "language": "语言",
-        "scan_tab": "扫描",
-        "debug_tab": "调试",
-        "scan_group": "扫描参数",
-        "scan_summary": "扫描统计",
-        "step_angle": "步进角",
-        "sound_speed": "声速",
-        "medium": "介质",
-        "view_mode": "视图模式",
-        "scan_view_cartesian": "距离-角度",
-        "scan_view_polar": "极坐标",
-        "expected_points": "预计点数: {value}",
-        "scan_progress_text": "进度: {done} / {total}",
-        "configure_scan": "配置扫描",
-        "start_scan": "开始扫描",
-        "save_scan_csv": "保存扫描 CSV",
-        "points_done": "已收点数",
-        "valid_points": "有效点数",
-        "distance_range": "距离范围",
-        "session": "任务状态",
-        "ring_count": "圈数",
-        "axial_position": "轴向位置",
-        "scan_3d_group": "3D 扫描 / 防撞",
-        "enable_3d": "启用 3D 点云",
-        "axial_step": "轴向步进",
-        "rings_per_level": "每位置圈数",
-        "enable_collision": "启用防撞",
-        "collision_threshold": "防撞阈值",
-        "sim_obstacle_distance": "仿真障碍距离",
-        "front_distance": "前向距离",
-        "point_cloud_status": "3D 状态",
-        "debug_controls": "调试控制",
-        "debug_state": "调试状态",
-        "probe_type": "探头类型",
-        "depth_probe": "测深度探头",
-        "rotary_probe": "侧扫探头",
-        "pulse_count": "脉冲数量",
-        "sample_rate": "采样率",
-        "debug_sound_speed": "波速",
-        "sweep_start": "起始角",
-        "sweep_end": "结束角",
-        "sweep_step": "扫角步进",
-        "sample_count": "采样点数",
-        "capture_type": "采集类型",
-        "upload_distance": "上传距离",
-        "upload_wave": "上传波形",
-        "config_single": "配置单点",
-        "move_to_angle": "转到目标角",
-        "single_measure": "单次测量",
-        "test_button": "测试",
-        "config_sweep": "配置扫角",
-        "start_sweep": "开始扫角",
-        "save_wave_csv": "保存波形 CSV",
-        "target": "目标: {value}",
-        "direction": "方向: {value}",
-        "arrived": "到位: {value}",
-        "distance": "距离: {value}",
-        "quality": "质量: {value}",
-        "wave": "波形: {value}",
-        "idle": "空闲",
-        "disconnected": "未连接",
-        "device_na": "设备: n/a",
-        "status_idle": "状态: IDLE",
-        "angle_fmt": "角度: {value}",
-        "mode_idle": "模式: 空闲",
-        "event_none": "事件: 无",
-        "record_off": "记录: 关闭",
-        "no_active_scan": "空闲",
-        "connected_loopback": "已连接: {port} @ {baud} (本地回环)",
-        "cartesian_plot_title": "距离-角度",
-        "polar_plot_title": "极坐标距离图",
-        "wave_plot_title": "波形",
-        "debug_sweep_plot_title": "调试扫角距离",
-        "cloud_window_title": "3D 点云窗口",
-        "lang_zh": "中文",
-        "lang_en": "英文",
+        "window_title": "???????",
+        "port": "??",
+        "baud": "???",
+        "connect": "??",
+        "disconnect": "??",
+        "refresh": "??",
+        "get_info": "????",
+        "zeroing": "??",
+        "stop": "??",
+        "start_record": "????",
+        "stop_record": "????",
+        "language": "??",
+        "scan_tab": "??",
+        "debug_tab": "??",
+        "scan_group": "????",
+        "scan_summary": "????",
+        "step_angle": "???",
+        "sound_speed": "??",
+        "medium": "??",
+        "view_mode": "????",
+        "scan_view_cartesian": "??-??",
+        "scan_view_polar": "???",
+        "expected_points": "????: {value}",
+        "scan_progress_text": "??: {done} / {total}",
+        "configure_scan": "????",
+        "start_scan": "????",
+        "save_scan_csv": "???? CSV",
+        "points_done": "????",
+        "valid_points": "????",
+        "distance_range": "????",
+        "session": "????",
+        "ring_count": "??",
+        "axial_position": "????",
+        "scan_3d_group": "3D ?? / ??",
+        "enable_3d": "?? 3D ??",
+        "axial_step": "????",
+        "rings_per_level": "?????",
+        "enable_collision": "????",
+        "collision_threshold": "????",
+        "sim_obstacle_distance": "??????",
+        "front_distance": "????",
+        "point_cloud_status": "3D ??",
+        "debug_controls": "????",
+        "debug_state": "????",
+        "probe_type": "????",
+        "depth_probe": "?????",
+        "rotary_probe": "????",
+        "pulse_count": "????",
+        "sample_rate": "???",
+        "debug_sound_speed": "??",
+        "sweep_start": "???",
+        "sweep_end": "???",
+        "sweep_step": "????",
+        "sample_count": "????",
+        "capture_type": "????",
+        "upload_distance": "????",
+        "upload_wave": "????",
+        "config_single": "????",
+        "move_to_angle": "?????",
+        "single_measure": "????",
+        "test_button": "??",
+        "config_sweep": "????",
+        "start_sweep": "????",
+        "save_wave_csv": "???? CSV",
+        "target": "??: {value}",
+        "direction": "??: {value}",
+        "arrived": "??: {value}",
+        "distance": "??: {value}",
+        "quality": "??: {value}",
+        "wave": "??: {value}",
+        "idle": "??",
+        "disconnected": "???",
+        "device_na": "??: n/a",
+        "status_idle": "??: IDLE",
+        "angle_fmt": "??: {value}",
+        "mode_idle": "??: ??",
+        "event_none": "??: ?",
+        "record_off": "??: ??",
+        "no_active_scan": "??",
+        "connected_loopback": "???: {port} @ {baud} (????)",
+        "cartesian_plot_title": "??-??",
+        "polar_plot_title": "??????",
+        "wave_plot_title": "??",
+        "debug_sweep_plot_title": "??????",
+        "cloud_window_title": "3D ????",
+        "lang_zh": "??",
+        "lang_en": "??",
     },
 }
 
@@ -1114,9 +1115,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.debug_sound_speed_spin.setSuffix(" m/s")
 
         self.sample_count_title = QtWidgets.QLabel()
-        self.sample_count_spin = QtWidgets.QSpinBox()
-        self.sample_count_spin.setRange(32, 7500)
-        self.sample_count_spin.setValue(7500)
+        self.sample_count_combo = QtWidgets.QComboBox()
+        for sample_count in DEBUG_SAMPLE_COUNT_OPTIONS:
+            self.sample_count_combo.addItem(str(sample_count), sample_count)
 
         self.capture_type_title = QtWidgets.QLabel()
         self.capture_type_combo = QtWidgets.QComboBox()
@@ -1140,7 +1141,7 @@ class MainWindow(QtWidgets.QMainWindow):
         control_form.addRow(self.debug_end_title, self.debug_end_spin)
         control_form.addRow(self.debug_step_title, self.debug_step_spin)
         control_form.addRow(self.debug_sound_speed_title, self.debug_sound_speed_spin)
-        control_form.addRow(self.sample_count_title, self.sample_count_spin)
+        control_form.addRow(self.sample_count_title, self.sample_count_combo)
         control_form.addRow(self.capture_type_title, self.capture_type_combo)
         control_form.addRow(self.pulse_count_title, self.pulse_count_spin)
         control_form.addRow(self.upload_wave_check)
@@ -1255,7 +1256,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.medium_title.setText(self._tr("medium"))
         self.configure_scan_button.setText(self._tr("configure_scan"))
         self.start_scan_button.setText(self._tr("start_scan"))
-        self.save_scan_button.setText("Save Table CSV" if self.language == "en" else "保存表格数据")
+        self.save_scan_button.setText("Save Table CSV" if self.language == "en" else "??????")
         self.points_done_title.setText(self._tr("points_done"))
         self.valid_points_title.setText(self._tr("valid_points"))
         self.distance_range_title.setText(self._tr("distance_range"))
@@ -1299,7 +1300,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.device_label.setText(self._tr("device_na"))
         self.status_label.setText(f"{self._tr('status_idle').split(':')[0]}: {self.device_status.name}")
         self.angle_label.setText(self._tr("angle_fmt", value=self._format_angle_value(self.current_angle)))
-        self.event_label.setText(self._tr("event_none") if self.event_label.text().endswith("none") or self.event_label.text().endswith("无") else self.event_label.text())
+        self.event_label.setText(self._tr("event_none") if self.event_label.text().endswith("none") or self.event_label.text().endswith("?") else self.event_label.text())
         self.debug_target_label.setText(self._tr("target", value=self._suffix_after_colon(self.debug_target_label.text())))
         self.debug_move_label.setText(self._tr("direction", value=self._suffix_after_colon(self.debug_move_label.text())))
         self.debug_arrived_label.setText(self._tr("arrived", value=self._suffix_after_colon(self.debug_arrived_label.text())))
@@ -1334,6 +1335,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.tabs.currentWidget() == self.debug_tab:
             self._notify_debug_mode_switch()
 
+    def _current_debug_sample_count(self) -> int:
+        value = self.sample_count_combo.currentData()
+        if isinstance(value, int):
+            return value
+        return DEBUG_SAMPLE_COUNT_OPTIONS[0]
+
     def _normalize_debug_angle_inputs(self) -> None:
         if self.debug_probe_type == ProbeType.DEPTH_PROBE:
             return
@@ -1363,8 +1370,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.debug_step_spin.value() <= 0.0:
                 self.debug_step_spin.setValue(self._normalize_motor_step_degrees(SIDE_SCAN_DEFAULT_STEP_DEG))
             self._normalize_debug_angle_inputs()
-        self.sample_count_spin.setValue(7500)
-        self.sample_count_spin.setEnabled(False)
+        self.sample_count_combo.setCurrentIndex(0)
+        self.sample_count_combo.setEnabled(True)
         self.capture_type_combo.setCurrentIndex(0)
         self.capture_type_combo.setEnabled(False)
         self.single_measure_button.setText(
@@ -1504,7 +1511,7 @@ class MainWindow(QtWidgets.QMainWindow):
             step_angle=0,
             capture_type=CaptureType.RAW_WAVE,
             probe_type=self.debug_probe_type,
-            sample_count=7500,
+            sample_count=self._current_debug_sample_count(),
             pulse_count=self.pulse_count_spin.value(),
             flags=flags,
         )
@@ -1537,7 +1544,7 @@ class MainWindow(QtWidgets.QMainWindow):
             step_angle=step_angle,
             capture_type=CaptureType.RAW_WAVE,
             probe_type=self.debug_probe_type,
-            sample_count=7500,
+            sample_count=self._current_debug_sample_count(),
             pulse_count=self.pulse_count_spin.value(),
             flags=flags,
         )
@@ -1599,7 +1606,7 @@ class MainWindow(QtWidgets.QMainWindow):
         suggested = self._default_scan_export_name()
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
-            "Save Table Data" if self.language == "en" else "保存表格数据",
+            "Save Table Data" if self.language == "en" else "??????",
             str(APP_DIR / suggested),
             "CSV Files (*.csv)",
         )

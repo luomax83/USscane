@@ -35,7 +35,10 @@
 #define UART_STREAM_BUFFER_SIZE 512U
 #define UART_TX_FRAME_BUFFER_SIZE 1040U
 #define WAVE_CHUNK_DATA_SIZE 240U
-#define DEPTH_SAMPLE_COUNT 7500U
+#define DEPTH_SAMPLE_COUNT_SHORT 7500U
+#define DEPTH_SAMPLE_COUNT_LONG 25000U
+#define DEPTH_SAMPLE_COUNT_DEFAULT DEPTH_SAMPLE_COUNT_SHORT
+#define DEPTH_SAMPLE_COUNT_MAX DEPTH_SAMPLE_COUNT_LONG
 #define DEPTH_BUFFER_COUNT 1U
 #define DEPTH_BUFFER_INVALID 0xFFU
 #define DEPTH_DEFAULT_PULSE_COUNT 6U
@@ -121,7 +124,7 @@ static uint8_t uart_stream_buffer[UART_STREAM_BUFFER_SIZE];
 static volatile uint16_t uart_stream_length = 0U;
 static uint8_t frame_payload_buffer[SONAR_PROTOCOL_MAX_PAYLOAD];
 static uint8_t uart_tx_frame_buffer[UART_TX_FRAME_BUFFER_SIZE];
-static __attribute__((section(".dma_buffer"), aligned(32))) uint16_t g_depth_samples[DEPTH_BUFFER_COUNT][DEPTH_SAMPLE_COUNT];
+static __attribute__((section(".dma_buffer"), aligned(32))) uint16_t g_depth_samples[DEPTH_BUFFER_COUNT][DEPTH_SAMPLE_COUNT_MAX];
 static DepthBufferSlot g_depth_buffer_slots[DEPTH_BUFFER_COUNT];
 static DepthUploadContext g_depth_upload;
 static SonarAppContext g_sonar_app;
@@ -237,6 +240,7 @@ static void App_ServiceBackgroundTasks(uint32_t duration_ms);
 static void App_FlushDepthUploads(uint32_t timeout_ms);
 static uint8_t App_HasFreeDepthBuffer(void);
 static uint8_t App_WaitForFreeDepthBuffer(uint32_t timeout_ms);
+static uint32_t App_GetWaveUploadTimeoutMs(uint16_t sample_count);
 static uint8_t App_IsDepthProbeMode(void);
 static uint8_t App_IsSideScanProbeMode(void);
 static uint32_t App_DCacheAlignDown(uint32_t address);
@@ -367,7 +371,7 @@ static void App_ProcessStateMachine(void)
     g_debug_upload_chunks = 0U;
     g_sonar_app.debug_config.probe_type = DEBUG_PROBE_TYPE_DEPTH;
     g_sonar_app.debug_config.capture_type = CAPTURE_TYPE_RAW_WAVE;
-    g_sonar_app.debug_config.sample_count = DEPTH_SAMPLE_COUNT;
+    g_sonar_app.debug_config.sample_count = DEPTH_SAMPLE_COUNT_DEFAULT;
     if (g_sonar_app.debug_config.pulse_count == 0U)
     {
       g_sonar_app.debug_config.pulse_count = DEPTH_DEFAULT_PULSE_COUNT;
@@ -1132,7 +1136,9 @@ static void App_HandleConfigDebug(uint16_t sequence, const uint8_t *payload, uin
 
   if ((g_sonar_app.debug_config.capture_type > CAPTURE_TYPE_ENVELOPE) ||
       (g_sonar_app.debug_config.probe_type > DEBUG_PROBE_TYPE_DEPTH) ||
-      (g_sonar_app.debug_config.pulse_count == 0U))
+      (g_sonar_app.debug_config.pulse_count == 0U) ||
+      ((g_sonar_app.debug_config.sample_count != DEPTH_SAMPLE_COUNT_SHORT) &&
+       (g_sonar_app.debug_config.sample_count != DEPTH_SAMPLE_COUNT_LONG)))
   {
     App_SendNack(sequence, SONAR_CMD_CONFIG_DEBUG, SONAR_RESULT_INVALID_PARAM);
     return;
@@ -1144,7 +1150,11 @@ static void App_HandleConfigDebug(uint16_t sequence, const uint8_t *payload, uin
     g_sonar_app.debug_config.end_angle = 0U;
     g_sonar_app.debug_config.step_angle = 0U;
     g_sonar_app.debug_config.capture_type = CAPTURE_TYPE_RAW_WAVE;
-    g_sonar_app.debug_config.sample_count = DEPTH_SAMPLE_COUNT;
+    if ((g_sonar_app.debug_config.sample_count != DEPTH_SAMPLE_COUNT_SHORT) &&
+        (g_sonar_app.debug_config.sample_count != DEPTH_SAMPLE_COUNT_LONG))
+    {
+      g_sonar_app.debug_config.sample_count = DEPTH_SAMPLE_COUNT_DEFAULT;
+    }
     g_sonar_app.mode = SONAR_APP_MODE_DEBUG_SINGLE;
   }
   else
@@ -1172,7 +1182,11 @@ static void App_HandleConfigDebug(uint16_t sequence, const uint8_t *payload, uin
     }
 
     g_sonar_app.debug_config.capture_type = CAPTURE_TYPE_RAW_WAVE;
-    g_sonar_app.debug_config.sample_count = DEPTH_SAMPLE_COUNT;
+    if ((g_sonar_app.debug_config.sample_count != DEPTH_SAMPLE_COUNT_SHORT) &&
+        (g_sonar_app.debug_config.sample_count != DEPTH_SAMPLE_COUNT_LONG))
+    {
+      g_sonar_app.debug_config.sample_count = DEPTH_SAMPLE_COUNT_DEFAULT;
+    }
   }
 
   if (g_sonar_app.debug_config.flags & 0x02U)
@@ -1402,7 +1416,7 @@ static void App_HandleStartDebugSweep(uint16_t sequence)
 
     if (has_wave != 0U)
     {
-      App_FlushDepthUploads(5000U);
+      App_FlushDepthUploads(App_GetWaveUploadTimeoutMs(g_sonar_app.debug_config.sample_count));
       uploaded_buffer_index = DEPTH_BUFFER_INVALID;
       if ((g_depth_upload.active != 0U) || (App_FindReadyDepthBuffer() < DEPTH_BUFFER_COUNT))
       {
@@ -1419,7 +1433,7 @@ static void App_HandleStartDebugSweep(uint16_t sequence)
 
   if (has_wave != 0U)
   {
-    App_FlushDepthUploads(5000U);
+    App_FlushDepthUploads(App_GetWaveUploadTimeoutMs(g_sonar_app.debug_config.sample_count));
   }
 
   {
@@ -1891,7 +1905,7 @@ static SonarResultCode App_RunBlockingMeasurement(uint16_t sequence, uint16_t an
   uint32_t started_ms = HAL_GetTick();
   uint8_t buffer_index = DEPTH_BUFFER_INVALID;
 
-  if (App_WaitForFreeDepthBuffer(5000U) == 0U)
+  if (App_WaitForFreeDepthBuffer(App_GetWaveUploadTimeoutMs(g_sonar_app.debug_config.sample_count)) == 0U)
   {
     return SONAR_RESULT_BUSY;
   }
@@ -1996,7 +2010,7 @@ static SonarResultCode App_CaptureSweepMeasurement(uint16_t sequence, uint32_t *
     *buffer_index = DEPTH_BUFFER_INVALID;
   }
 
-  if (App_WaitForFreeDepthBuffer(8000U) == 0U)
+  if (App_WaitForFreeDepthBuffer(App_GetWaveUploadTimeoutMs(g_sonar_app.debug_config.sample_count)) == 0U)
   {
     return SONAR_RESULT_BUSY;
   }
@@ -2151,6 +2165,25 @@ static uint8_t App_WaitForFreeDepthBuffer(uint32_t timeout_ms)
   return App_HasFreeDepthBuffer();
 }
 
+static uint32_t App_GetWaveUploadTimeoutMs(uint16_t sample_count)
+{
+  uint32_t total_wave_bytes = (uint32_t)sample_count * 2U;
+  uint32_t total_frames = (total_wave_bytes + WAVE_CHUNK_DATA_SIZE - 1U) / WAVE_CHUNK_DATA_SIZE;
+  uint32_t framed_bytes = total_wave_bytes + (total_frames * 32U) + 32U;
+  uint32_t timeout_ms = ((framed_bytes * 10U * 1000U) / 115200U) + 2500U;
+
+  if (timeout_ms < 5000U)
+  {
+    timeout_ms = 5000U;
+  }
+  if (timeout_ms > 15000U)
+  {
+    timeout_ms = 15000U;
+  }
+
+  return timeout_ms;
+}
+
 static uint8_t App_ComputeMoveDirection(uint16_t current_angle, uint16_t target_angle)
 {
   uint16_t clockwise = 0U;
@@ -2278,7 +2311,7 @@ static void App_StartDepthCapture(uint16_t sequence)
   g_depth_completed_buffer_index = DEPTH_BUFFER_INVALID;
   g_depth_timeout_buffer_index = DEPTH_BUFFER_INVALID;
   g_depth_buffer_slots[buffer_index].state = DEPTH_BUFFER_STATE_FILLING;
-  g_depth_buffer_slots[buffer_index].sample_count = DEPTH_SAMPLE_COUNT;
+  g_depth_buffer_slots[buffer_index].sample_count = g_sonar_app.debug_config.sample_count;
   g_depth_buffer_slots[buffer_index].sequence = sequence;
   g_depth_buffer_slots[buffer_index].angle = g_sonar_app.current_angle;
   g_debug_upload_stage = 1U;
@@ -2293,7 +2326,10 @@ static void App_StartDepthCapture(uint16_t sequence)
   __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
   __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
 
-  if (HAL_ADC_Start_DMA(g_active_capture_adc, (uint32_t *)g_depth_samples[buffer_index], DEPTH_SAMPLE_COUNT) != HAL_OK)
+  if (HAL_ADC_Start_DMA(
+          g_active_capture_adc,
+          (uint32_t *)g_depth_samples[buffer_index],
+          g_depth_buffer_slots[buffer_index].sample_count) != HAL_OK)
   {
     App_ReleaseDepthBuffer(buffer_index);
     g_depth_capture_buffer_index = DEPTH_BUFFER_INVALID;
@@ -2497,7 +2533,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
   if ((g_depth_capture_active != 0U) && (g_active_capture_adc != NULL) && (hadc->Instance == g_active_capture_adc->Instance))
   {
     uint8_t buffer_index = g_depth_capture_buffer_index;
-    uint16_t sample_count = DEPTH_SAMPLE_COUNT;
+    uint16_t sample_count = DEPTH_SAMPLE_COUNT_DEFAULT;
 
     g_capture_finished_cycles = DWT->CYCCNT;
     if (buffer_index < DEPTH_BUFFER_COUNT)
